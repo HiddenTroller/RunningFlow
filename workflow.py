@@ -3,11 +3,10 @@ import copy
 import secrets
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from matcher import compare_ingredients, manufacturer_matches, official_calculation_product, text
 from mfds_client import MFDSClient, ServiceError
-from studio_client import analyze_photo, product_names_from_final
+from studio_client import analyze_photo
 from calculator import calculate
 from supplemental_client import SupplementalClient
 from extraction_adapter import normalize_extraction
@@ -22,7 +21,6 @@ class AnalysisWorkflow:
         self.analyzer = analyzer or analyze_photo
         self.records = {}
         self.lock = threading.Lock()
-        self.detail_cache = {}
 
     def _put(self, kind, value):
         with self.lock:
@@ -46,23 +44,6 @@ class AnalysisWorkflow:
 
     def analyze_and_match(self, content, mime):
         studio = self.analyzer(content, mime)
-        names = product_names_from_final(studio.get('final_text', ''))
-        if names is not None:
-            def match_product(entry):
-                index,name=entry
-                # Never share a mixed-photo ingredient record between products.
-                try:
-                    result=self.match_extracted({},name='' if name=='확인필요' else name)
-                except ServiceError as error:
-                    result={'candidates':[],'total':0,'photo_extracted':{},'reason':str(error)}
-                result.update(product_index=index,search_name=name)
-                return result
-            # Bounded concurrency keeps product states separate and respects API load.
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                results=list(pool.map(match_product,enumerate(names,1)))
-            return {'multi_product':True,'products':results,'studio':studio,
-                    'photo_extracted':{},'candidates':[], 'total':len(results),
-                    'reason':'' if results else '사진에서 식별 가능한 약품을 찾지 못했습니다.'}
         extracted = studio.get('extracted')
         extracted = extracted if isinstance(extracted, dict) else {}
         search_name = studio.get('search_product_name')
@@ -72,21 +53,6 @@ class AnalysisWorkflow:
             result['reason'] = 'Instruct 최종 결과에서 단일 검색용 제품명을 확인하지 못했습니다. Extract 제품명으로 대체하지 않았습니다. 직접 검색하세요.'
         result['studio'] = studio
         return result
-
-    def cached_search_detail(self, code):
-        """Reuse only complete successful official details, at most 5 minutes."""
-        with self.lock:
-            cached=self.detail_cache.get(code)
-            if cached and time.monotonic()-cached[0]<300:
-                return copy.deepcopy(cached[1])
-        detail=self.client.detail(code)
-        if detail.get('ingredients_raw') and not detail.get('warnings'):
-            with self.lock:
-                now=time.monotonic()
-                self.detail_cache={k:v for k,v in self.detail_cache.items() if now-v[0]<300}
-                if len(self.detail_cache)>=100:self.detail_cache.pop(next(iter(self.detail_cache)))
-                self.detail_cache[code]=(now,copy.deepcopy(detail))
-        return detail
 
     def match_extracted(self, extracted, name=None, page=1):
         extracted, extraction_warnings = normalize_extraction(extracted)
@@ -120,7 +86,7 @@ class AnalysisWorkflow:
                 continue
             seen.add(code)
             try:
-                detail = apply_override(self.cached_search_detail(code))
+                detail = apply_override(self.client.detail(code))
                 comparison = compare_ingredients(extracted, detail)
             except ServiceError:
                 detail = {'product': item, 'ingredients_raw': [], 'warnings': ['공식 상세 조회 실패. 확인 필요.'],

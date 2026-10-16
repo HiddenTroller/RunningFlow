@@ -13,9 +13,9 @@ class StudioRevisedTests(unittest.TestCase):
     def test_all_steps_requested(self):
         self.assertEqual(build_job_payload('agt_test','file-test')['include'],['all'])
 
-    def test_latest_ignores_legacy_pin(self):
-        self.assertNotIn('config_id',build_job_payload('agt_test','file-test',' 5 '))
-        self.assertNotIn('config_id',build_job_payload('agt_test','file-test','  '))
+    def test_version15_overrides_legacy_pin(self):
+        self.assertEqual(build_job_payload('agt_test','file-test',' 5 ')['config_id'],'15')
+        self.assertEqual(build_job_payload('agt_test','file-test','  ')['config_id'],'15')
 
     def test_extract_before_instruct(self):
         result=select_output({'output':[step('step_parse','{}'),step('step_Extract','{"product_name_raw":"Extract"}'),step('instruct','{"product_name_raw":"Instruct"}')]})
@@ -44,7 +44,7 @@ class StudioRevisedTests(unittest.TestCase):
             result=analyze_photo(b'photo','image/png')
         self.assertIn(('/files/file-test','DELETE'),calls)
         self.assertEqual(result['file_cleanup'],'deleted')
-        self.assertEqual(result['config_policy'],'latest')
+        self.assertEqual(result['config_policy'],'pinned')
 
     def test_delete_on_failed_job(self):
         methods=[]

@@ -18,20 +18,8 @@ def dosage_text(value):
     if not isinstance(value,str) or not value.strip():return ''
     try:
         root=ET.fromstring(value)
-        fragments=[]
-        def collect(element):
-            # MFDS can put entire regimens in SECTION/ARTICLE title attributes.
-            if element.tag in ('SECTION','ARTICLE') and element.get('title','').strip():
-                fragments.append(element.get('title').strip())
-            if element.tag == 'PARAGRAPH':
-                fragments.append(''.join(element.itertext()))
-                return
-            if element.text and element.text.strip(): fragments.append(element.text)
-            for child in element:
-                collect(child)
-                if child.tail and child.tail.strip(): fragments.append(child.tail)
-        collect(root)
-        raw='\n'.join(fragments)
+        fragments=[''.join(e.itertext()) for e in root.iter('PARAGRAPH')]
+        raw='\n'.join(fragments) if fragments else ''.join(root.itertext())
     except ET.ParseError:raw=value
     parser=PlainText();parser.feed(raw);parser.close()
     return '\n'.join(re.sub(r'[ \t\r]+',' ',line).strip(' |') for line in ''.join(parser.parts).split('\n') if line.strip(' |\r\t '))
