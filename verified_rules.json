@@ -1,0 +1,260 @@
+[
+  {
+    "id": "ibuprofen-child-1",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=198601920",
+    "source_evidence": "어린이 1일 최대용량 표: 1~2세 400mg. 전체 허가 원문은 보관 자료 참조.",
+    "product_name": "어린이부루펜시럽(이부프로펜)",
+    "ingredient_code": "M051259",
+    "mode": "day",
+    "population": "child",
+    "product_codes": [
+      "198601920"
+    ],
+    "sex": "any",
+    "min_age_years": 1,
+    "limit_mg": "400",
+    "max_age_years": 3
+  },
+  {
+    "id": "ibuprofen-child-3",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=198601920",
+    "source_evidence": "어린이 1일 최대용량 표: 3~6세 600mg. 전체 허가 원문은 보관 자료 참조.",
+    "product_name": "어린이부루펜시럽(이부프로펜)",
+    "ingredient_code": "M051259",
+    "mode": "day",
+    "population": "child",
+    "product_codes": [
+      "198601920"
+    ],
+    "sex": "any",
+    "min_age_years": 3,
+    "limit_mg": "600",
+    "max_age_years": 7
+  },
+  {
+    "id": "ibuprofen-child-7",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=198601920",
+    "source_evidence": "어린이 1일 최대용량 표: 7~10세 800mg. 전체 허가 원문은 보관 자료 참조.",
+    "product_name": "어린이부루펜시럽(이부프로펜)",
+    "ingredient_code": "M051259",
+    "mode": "day",
+    "population": "child",
+    "product_codes": [
+      "198601920"
+    ],
+    "sex": "any",
+    "min_age_years": 7,
+    "limit_mg": "800",
+    "max_age_years": 11
+  },
+  {
+    "id": "ibuprofen-child-11",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=198601920",
+    "source_evidence": "어린이 1일 최대용량 표: 11~14세 1000mg. 전체 허가 원문은 보관 자료 참조.",
+    "product_name": "어린이부루펜시럽(이부프로펜)",
+    "ingredient_code": "M051259",
+    "mode": "day",
+    "population": "child",
+    "product_codes": [
+      "198601920"
+    ],
+    "sex": "any",
+    "min_age_years": 11,
+    "limit_mg": "1000",
+    "max_age_years": 15
+  },
+  {
+    "id": "child-acetaminophen-weight-child",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=202200525",
+    "source_evidence": "만 12세 이하 소아: 1일 5회(75mg/kg)를 초과하지 않음. 4~6시간마다 필요시 복용. 현재 자동 비교 범위는 만 1세 이상 13세 미만·7kg 이상 43kg 미만으로 제한.",
+    "product_name": "어린이타이레놀현탁액(아세트아미노펜)",
+    "ingredient_code": "M281939",
+    "mode": "day",
+    "population": "child",
+    "product_codes": [
+      "202200525"
+    ],
+    "sex": "any",
+    "min_age_years": 1,
+    "limit_mg_per_kg": "75",
+    "min_weight_kg": 7,
+    "max_weight_kg": 43,
+    "max_age_years": 13
+  },
+  {
+    "id": "acetaminophen-12plus-child",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=202106092",
+    "source_evidence": "만 12세 이상 소아 및 성인: 1회 1~2정씩 1일 3~4회(4~6시간마다) 필요시 복용. 1일 최대 4그램(8정)을 초과하지 않음.",
+    "product_name": "타이레놀정500밀리그람(아세트아미노펜)",
+    "ingredient_code": "M040353",
+    "mode": "day",
+    "population": "child",
+    "product_codes": [
+      "202106092"
+    ],
+    "sex": "any",
+    "min_age_years": 12,
+    "limit_mg": "4000"
+  },
+  {
+    "id": "ibuprofen-adolescent-1",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=198601920",
+    "source_evidence": "어린이 1일 최대용량 표: 1~2세 400mg. 전체 허가 원문은 보관 자료 참조.",
+    "product_name": "어린이부루펜시럽(이부프로펜)",
+    "ingredient_code": "M051259",
+    "mode": "day",
+    "population": "adolescent",
+    "product_codes": [
+      "198601920"
+    ],
+    "sex": "any",
+    "min_age_years": 1,
+    "limit_mg": "400",
+    "max_age_years": 3
+  },
+  {
+    "id": "ibuprofen-adolescent-3",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=198601920",
+    "source_evidence": "어린이 1일 최대용량 표: 3~6세 600mg. 전체 허가 원문은 보관 자료 참조.",
+    "product_name": "어린이부루펜시럽(이부프로펜)",
+    "ingredient_code": "M051259",
+    "mode": "day",
+    "population": "adolescent",
+    "product_codes": [
+      "198601920"
+    ],
+    "sex": "any",
+    "min_age_years": 3,
+    "limit_mg": "600",
+    "max_age_years": 7
+  },
+  {
+    "id": "ibuprofen-adolescent-7",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=198601920",
+    "source_evidence": "어린이 1일 최대용량 표: 7~10세 800mg. 전체 허가 원문은 보관 자료 참조.",
+    "product_name": "어린이부루펜시럽(이부프로펜)",
+    "ingredient_code": "M051259",
+    "mode": "day",
+    "population": "adolescent",
+    "product_codes": [
+      "198601920"
+    ],
+    "sex": "any",
+    "min_age_years": 7,
+    "limit_mg": "800",
+    "max_age_years": 11
+  },
+  {
+    "id": "ibuprofen-adolescent-11",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=198601920",
+    "source_evidence": "어린이 1일 최대용량 표: 11~14세 1000mg. 전체 허가 원문은 보관 자료 참조.",
+    "product_name": "어린이부루펜시럽(이부프로펜)",
+    "ingredient_code": "M051259",
+    "mode": "day",
+    "population": "adolescent",
+    "product_codes": [
+      "198601920"
+    ],
+    "sex": "any",
+    "min_age_years": 11,
+    "limit_mg": "1000",
+    "max_age_years": 15
+  },
+  {
+    "id": "child-acetaminophen-weight-adolescent",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=202200525",
+    "source_evidence": "만 12세 이하 소아: 1일 5회(75mg/kg)를 초과하지 않음. 4~6시간마다 필요시 복용. 현재 자동 비교 범위는 만 1세 이상 13세 미만·7kg 이상 43kg 미만으로 제한.",
+    "product_name": "어린이타이레놀현탁액(아세트아미노펜)",
+    "ingredient_code": "M281939",
+    "mode": "day",
+    "population": "adolescent",
+    "product_codes": [
+      "202200525"
+    ],
+    "sex": "any",
+    "min_age_years": 1,
+    "limit_mg_per_kg": "75",
+    "min_weight_kg": 7,
+    "max_weight_kg": 43,
+    "max_age_years": 13
+  },
+  {
+    "id": "acetaminophen-12plus-adolescent",
+    "reviewed": true,
+    "reviewer": "공식 원문 대조 / 사용자 등록 승인",
+    "review_method": "2026-10-16 사용자 검토안 등록 승인; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "source_url": "https://nedrug.mfds.go.kr/pbp/CCBBB01/getItemDetail?itemSeq=202106092",
+    "source_evidence": "만 12세 이상 소아 및 성인: 1회 1~2정씩 1일 3~4회(4~6시간마다) 필요시 복용. 1일 최대 4그램(8정)을 초과하지 않음.",
+    "product_name": "타이레놀정500밀리그람(아세트아미노펜)",
+    "ingredient_code": "M040353",
+    "mode": "day",
+    "population": "adolescent",
+    "product_codes": [
+      "202106092"
+    ],
+    "sex": "any",
+    "min_age_years": 12,
+    "limit_mg": "4000"
+  },
+  {
+    "id": "mfds-acetaminophen-adult-total-day",
+    "reviewed": true,
+    "reviewer": "공식 식약처 원문 대조",
+    "review_method": "사용자 요청에 따른 공식 출처 대조; 의료전문가 검토 아님",
+    "reviewed_at": "2026-10-16",
+    "scope": "ingredient",
+    "population": "adult",
+    "min_age_years": 19,
+    "ingredient_code": "M040353",
+    "mode": "day",
+    "sex": "any",
+    "limit_mg": "4000",
+    "source_url": "https://impfood.mfds.go.kr/CFBBB02F02/getCntntsDetail?cntntsSn=281811",
+    "source_evidence": "식약처 감기약 안전사용 자료: 아세트아미노펜은 성인 기준 하루 4,000mg을 초과하지 않도록 안내하며, 감기약과 두통약·진통제 등의 동시 사용 시 함유 여부 확인을 안내함. 서비스는 만 19세 이상으로 지원 범위를 제한함. 개인별 간질환·음주·복용 간격과 각 제품의 더 낮은 용법 제한을 평가한 기준은 아님."
+  }
+]
