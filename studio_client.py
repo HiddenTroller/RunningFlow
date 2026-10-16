@@ -14,12 +14,12 @@ from extraction_adapter import normalize_extraction
 
 BASE = 'https://api.upstage.ai/v2'
 LOG = logging.getLogger(__name__)
-CONFIG_POLICY = 'latest'
+PINNED_CONFIG_ID = '15'
 
 
 def build_job_payload(agent, file_id, config_id=None):
-    """항상 최신 설정을 요청합니다. 호환 인자와 과거 고정 환경 변수는 무시합니다."""
-    payload = {'model': agent, 'include': ['all'], 'input': [
+    """사용자 요청으로 설정 15 고정. 호환 인자나 환경 변수로 변경하지 않습니다."""
+    payload = {'model': agent, 'config_id': PINNED_CONFIG_ID, 'include': ['all'], 'input': [
         {'role': 'user', 'content': [{'type': 'input_file', 'file_id': file_id}]}]}
     return payload
 
@@ -108,37 +108,6 @@ def search_name_from_final(value):
     return candidate if valid else ''
 
 
-def product_names_from_final(value):
-    """None means legacy output; [] means explicit empty product list."""
-    candidate=value.strip() if isinstance(value,str) else ''
-    fenced=re.fullmatch(r'```(?:json)?\s*([\s\S]*?)\s*```',candidate,re.I)
-    if fenced:candidate=fenced.group(1)
-    try:parsed=json.loads(candidate)
-    except (ValueError,TypeError):parsed=None
-    if isinstance(parsed,dict) and '제품목록' in parsed:
-        rows=parsed['제품목록']
-    elif parsed is None or isinstance(parsed,str):
-        # Some Instruct versions emit quoted newline-delimited names rather than JSON arrays.
-        multiline=parsed if isinstance(parsed,str) else candidate
-        if len(multiline)>=2 and multiline[0]==multiline[-1]=='"':multiline=multiline[1:-1]
-        multiline=multiline.replace('\\r\\n','\n').replace('\\n','\n').replace('\r\n','\n')
-        lines=[line.strip() for line in multiline.splitlines() if line.strip()]
-        if len(lines)<2:return None
-        rows=[{'제품명':line} for line in lines]
-    else:return None
-    if not isinstance(rows,list) or len(rows)>30:
-        raise ServiceError('제품목록은 최대 30개 제품의 배열이어야 합니다.')
-    names=[];seen=set()
-    for row in rows:
-        raw=row.get('제품명') if isinstance(row,dict) else None
-        name=search_name_from_final(raw) if isinstance(raw,str) else ''
-        name=name or '확인필요'
-        key=re.sub(r'\s+','',name).lower()
-        if name!='확인필요' and key in seen:continue
-        seen.add(key);names.append(name)
-    return names
-
-
 def final_output(job):
     """Instruct 또는 Extract/Parse가 아닌 최종 메시지를 읽습니다."""
     outputs = job.get('output')
@@ -190,8 +159,8 @@ def analyze_photo(content, mime):
         extracted, adapter_warnings = normalize_extraction(raw_extracted)
         warnings.extend(adapter_warnings)
         result = {'job_id': job['id'], 'agent_id': agent,
-                  'config_policy': CONFIG_POLICY,
-                  'requested_config_id': None, 'config_id': job.get('config_id'),
+                  'config_policy': 'pinned',
+                  'requested_config_id': PINNED_CONFIG_ID, 'config_id': job.get('config_id'),
                   'legacy_config_ignored': bool(config.get('UPSTAGE_CONFIG_ID', '').strip()),
                   'selected_model': selected, 'text': text, 'extracted': extracted,
                   'raw_extracted': raw_extracted, 'warnings': warnings}

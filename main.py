@@ -16,9 +16,8 @@ from urllib.parse import urlsplit
 
 from config import ROOT, settings
 from mfds_client import MFDSClient, ServiceError
-from studio_client import analyze_photo, CONFIG_POLICY
+from studio_client import analyze_photo, PINNED_CONFIG_ID
 from calculator import calculate
-from duplicates import compare_duplicates, identity_only_product
 from population_rules import require_complete_profile
 from workflow import AnalysisWorkflow
 
@@ -42,31 +41,15 @@ def status_payload():
     return {'mfds_ready': bool(conf.get('MFDS_SERVICE_KEY')),
             'studio_ready': bool(conf.get('UPSTAGE_API_KEY')),
             'agent_id': conf.get('UPSTAGE_AGENT_ID', ''),
-            'config_policy': CONFIG_POLICY, 'requested_config_id': None,
+            'config_policy': 'pinned', 'requested_config_id': PINNED_CONFIG_ID,
             'legacy_config_ignored': bool(conf.get('UPSTAGE_CONFIG_ID', '').strip()),
-            'refresh_behavior': 'status_only', 'features': ['duplicates_only_v1'], 'client_revision': client_revision(),
+            'refresh_behavior': 'status_only', 'client_revision': client_revision(),
             'checked_at': datetime.now(timezone.utc).isoformat(), 'token': TOKEN}
 
 
 def dispatch_post(path, data):
     """HTTP 처리와 분리해 새 경로도 외부 API 없이 테스트할 수 있게 합니다."""
     client = MFDSClient()
-    if path in ('/api/check-duplicates', '/api/demo-duplicates'):
-        if path == '/api/demo-duplicates':
-            products = json.loads((STATIC / 'sample.json').read_text(encoding='utf-8'))
-        else:
-            submitted = data.get('products')
-            if not isinstance(submitted, list) or not 1 <= len(submitted) <= 30:
-                raise ServiceError('확인된 제품을 1~30개 추가하세요.')
-            products = []
-            for item in submitted:
-                if not isinstance(item, dict): raise ServiceError('제품 목록을 확인하세요.')
-                if item.get('approval_id'):
-                    product = WORKFLOW._get(item.get('approval_id'), 'approved')
-                else:
-                    product = identity_only_product(WORKFLOW._get(item.get('candidate_id'), 'candidate'))
-                if not any(p['code'] == product['code'] for p in products): products.append(product)
-        return compare_duplicates(products)
     if path == '/api/search':
         page = int(data.get('page', 1))
         if not 1 <= page <= 1000:
@@ -241,8 +224,7 @@ def run():
             with build_opener(ProxyHandler({})).open('http://' + ALLOWED_HOST + '/api/status', timeout=3) as response:
                 existing = json.loads(response.read(65536))
             same_app = (existing.get('refresh_behavior') == 'status_only'
-                        and existing.get('config_policy') == CONFIG_POLICY
-                        and 'duplicates_only_v1' in existing.get('features', [])
+                        and existing.get('config_policy') == 'pinned'
                         and existing.get('client_revision') == client_revision())
         except Exception:
             same_app = False
