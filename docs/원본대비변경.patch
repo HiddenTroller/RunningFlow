@@ -1,0 +1,1924 @@
+--- original/.env.example
++++ revised/.env.example
+@@ -5,4 +5,6 @@
+ UPSTAGE_AGENT_ID=agt_ZFvwgYPuoG7ppQanNZhNqL
+ # 현재 공식 명세에서 확인한 버전. API 개편 시 명세와 함께 수정하세요.
+ MFDS_BASE_URL=https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService08
+-PORT=8766
++PORT=8767
++
++# 항상 최신 설정만 사용합니다. UPSTAGE_CONFIG_ID는 설정해도 무시합니다.
+--- original/calculator.py
++++ revised/calculator.py
+@@ -3,6 +3,7 @@
+ from datetime import datetime, timezone
+ 
+ from mfds_client import ServiceError
++from normalization import normalize_name
+ 
+ FACTORS = {'mg': Decimal('1'), 'g': Decimal('1000'), 'μg': Decimal('0.001'),
+            'µg': Decimal('0.001'), 'ug': Decimal('0.001'), 'mcg': Decimal('0.001')}
+@@ -16,6 +17,13 @@
+     if not result.is_finite() or result < 0 or (not allow_zero and result == 0) or result > 1000000:
+         raise ServiceError(label + ': 유효한 범위의 양수를 입력하세요.')
+     return result
++
++
++def to_mg(value, unit):
++    """대조와 계산에서 공통 Decimal 환산 로직 사용."""
++    if unit not in FACTORS:
++        raise ServiceError('지원하지 않는 함량 단위입니다. 확인 필요.')
++    return number(value, '함량') * FACTORS[unit]
+ 
+ 
+ def calculate(products, mode='single', rules=None):
+@@ -53,15 +61,15 @@
+             if not component or not evidence or unit not in FACTORS or ingredient.get('basis_unit') != basis_unit:
+                 raise ServiceError(name + ': 성분명·지원 단위·함량 기준·원문 근거를 확인하세요.')
+             # 코드가 있으면 코드로, 없으면 정확한 표기명으로만 묶고 일치 수준을 별도 표시합니다.
+-            key = 'code:' + mapping_code if mapping_code else 'name:' + component
++            key = 'code:' + mapping_code if mapping_code else 'name:' + normalize_name(component)
+             if key in ingredient_seen:
+                 raise ServiceError(name + ': 동일 성분 행이 반복됩니다. 중복 행을 확인하세요.')
+             ingredient_seen.add(key)
+             amount = number(ingredient.get('amount'), component + ' 함량')
+             basis = number(ingredient.get('basis_quantity'), component + ' 기준 수량')
+-            dose = amount * FACTORS[unit] * quantity / basis
++            dose = to_mg(amount, unit) * quantity / basis
+             row = totals.setdefault(key, {'ingredient': component, 'ingredient_code': mapping_code,
+-                                         'matching': '공식 성분코드' if mapping_code else '정확한 표기명만 일치',
++                                         'matching': '공식 성분코드' if mapping_code else '이름 기준으로 묶음',
+                                          'total': Decimal('0'), 'products': [], 'contributions': []})
+             row['total'] += dose
+             row['products'].append(code)
+@@ -79,7 +87,8 @@
+                       and r.get('ingredient_code') and r.get('ingredient_code') == row['ingredient_code']
+                       and r.get('mode') == mode and r.get('population') == 'adult'
+                       and r.get('reviewer') and r.get('reviewed_at') and r.get('source_url')
+-                      and set(row['products']).issubset(set(r.get('product_codes', [])))]
++                      and (not r.get('product_codes') or
++                           set(row['products']).issubset(set(r['product_codes'])))]
+         row['criterion_status'] = 'unknown'
+         row['criterion_note'] = '적용 가능한 검증 기준 없음. 초과 여부 미판정.'
+         if len(candidates) == 1:
+--- original/config.py
++++ revised/config.py
+@@ -1,6 +1,5 @@
+ """작업 폴더에 상관없이 이 프로젝트의 .env를 읽습니다. 비밀값은 출력하지 않습니다."""
+ from pathlib import Path
+-import os
+ 
+ ROOT = Path(__file__).resolve().parent
+ 
+@@ -15,7 +14,4 @@
+                 continue
+             key, value = line.split('=', 1)
+             values[key.strip()] = value.strip().strip('\"\'')
+-    for key in ('MFDS_SERVICE_KEY', 'UPSTAGE_API_KEY', 'UPSTAGE_AGENT_ID', 'MFDS_BASE_URL', 'PORT'):
+-        if key in os.environ:
+-            values[key] = os.environ[key]
+     return values
+--- original/diagnose_mfds.py
++++ revised/diagnose_mfds.py
+@@ -10,7 +10,7 @@
+     key = conf.get('MFDS_SERVICE_KEY', '')
+     print('설정 파일: 프로젝트 폴더의 .env')
+     print('키 입력:', '있음' if key else '없음')
+-    print('환경변수 우선 적용:', '예 (VS Code 실행 환경에 별도 키가 있음)' if 'MFDS_SERVICE_KEY' in os.environ else '아니요 (.env 사용)')
++    print('인증키 출처: 수정본 프로젝트의 .env만 사용')
+     print('키 형태:', 'Upstage 키로 보임 — 잘못된 키' if key.startswith('up_') else '공공데이터 키 형식 확인 필요' if not key else '입력됨 (실제 유효성은 서버에서 확인)')
+     print('인코딩 키 처리:', 'URL 디코딩 후 한 번 인코딩' if unquote(key) != key else '요청변수로 한 번 인코딩')
+     print('키 내부 공백:', '있음 — 제거 필요' if any(c.isspace() for c in key) else '없음')
+--- original/extraction_adapter.py
++++ revised/extraction_adapter.py
+@@ -0,0 +1,120 @@
++"""Studio의 한국어/영문 Extract를 공통 구조로 연결. 원문 보존, 정보 추정 금지."""
++import re
++
++
++def scalar(value):
++    if isinstance(value, str):
++        return value.strip()
++    if isinstance(value, list):
++        values = [v.strip() for v in value if isinstance(v, str) and v.strip()]
++        # 제품명처럼 단일 값은 한 값이 명확할 때만 사용합니다.
++        return values[0] if len(values) == 1 else ''
++    return ''
++
++
++def original_text(value):
++    if isinstance(value, str):
++        return value.strip()
++    if isinstance(value, list):
++        return '\n'.join(v.strip() for v in value if isinstance(v, str) and v.strip())
++    return ''
++
++
++def pick(data, *keys):
++    for key in keys:
++        value = data.get(key)
++        if value not in (None, '', []):
++            return value
++    return None
++
++
++def ingredient_row(value):
++    if isinstance(value, dict):
++        result = dict(value)
++        name = scalar(pick(value, 'ingredient_name', '성분명'))
++        strength = scalar(pick(value, 'strength_per_unit', '함량 원문'))
++        if not strength:
++            amount, unit = pick(value, '함량', 'amount'), scalar(pick(value, '단위', 'unit'))
++            if isinstance(amount, (str, int, float)) and not isinstance(amount, bool) and unit:
++                strength = str(amount).strip() + ' ' + unit
++                basis = scalar(pick(value, '함량 기준', '함량기준', 'basis'))
++                if re.fullmatch(r'[0-9]+(?:\.[0-9]+)?\s*(?:정|캡슐|포|mL)', basis, re.I):
++                    strength = basis + ' 중 ' + strength
++        result.update(ingredient_name=name,
++                      base_ingredient_name=scalar(pick(value, 'base_ingredient_name', '기본성분명')) or name,
++                      strength_per_unit=strength,
++                      ingredient_standard=scalar(pick(value, 'ingredient_standard', '규격')),
++                      source_raw=value.get('source_raw', value))
++        return result
++    if not isinstance(value, str) or not value.strip():
++        return None
++    raw = value.strip()
++    parts = [part.strip() for part in raw.split('/')]
++    name, strength = '', ''
++    if len(parts) in (3, 4) and parts[0]:
++        # 실제 저장 결과 예: 아세트아미노펜 / 500 / mg / 1정.
++        # 숫자와 단위를 결합할 뿐, 해석 불가 함량을 유효 숫자로 만들지 않습니다.
++        name = parts[0]
++        strength = parts[1] + ' ' + parts[2]
++        if len(parts) == 4:
++            basis = parts[3]
++            if re.fullmatch(r'[0-9]+(?:\.[0-9]+)?\s*(?:정|캡슐|포|mL)', basis, re.I):
++                strength = basis + ' 중 ' + strength
++            elif basis not in ('', '기재 없음', '판독 불가', '확인 필요'):
++                # 알 수 없는 분모를 버려 잘못 일치시키지 않습니다.
++                strength = raw
++    else:
++        # 사람이 보기 좋은 결합 표기도 명시된 숫자/단위가 있을 때만 분리.
++        match = re.fullmatch(r'(.+?)\s+([0-9]+(?:\.[0-9]+)?\s*(?:밀리그램|마이크로그램|그램|mg|mcg|ug|μg|µg|g))(?:\s*\(([0-9]+(?:\.[0-9]+)?\s*(?:정|캡슐|포|mL))당\))?', raw, re.I)
++        if match:
++            name, strength = match.group(1).strip(), match.group(2)
++            if match.group(3):
++                strength = match.group(3) + ' 중 ' + strength
++    return {'ingredient_name': name or raw, 'base_ingredient_name': name or raw,
++            'strength_per_unit': strength, 'ingredient_standard': '', 'source_raw': value}
++
++
++def normalize_extraction(data):
++    if not isinstance(data, dict):
++        return {}, ['Extract JSON 객체를 확인하지 못했습니다. 확인 필요.']
++    # 한 단계의 표준 래퍼만 해제합니다. 임의 재귀 검색으로 다른 제품을 섞지 않음.
++    for wrapper in ('extracted', 'data'):
++        if not any(k in data for k in ('제품명', 'product_name_raw', 'effective_ingredients', '유효성분 목록')) and isinstance(data.get(wrapper), dict):
++            data = data[wrapper]
++            break
++    warnings = list(data.get('adapter_warnings', [])) if isinstance(data.get('adapter_warnings'), list) else []
++    result = dict(data)
++    result.update(product_name_raw=scalar(pick(data, 'product_name_raw', '제품명', 'product_name')),
++                  manufacturer=scalar(pick(data, 'manufacturer', '제조사', '업체명')),
++                  dosage_and_administration=original_text(pick(data, 'dosage_and_administration', '성인 용법·용량', '성인 용법용량')),
++                  max_daily_dose=original_text(pick(data, 'max_daily_dose', '하루 최대량')))
++    values = pick(data, 'effective_ingredients', '유효성분 목록')
++    if isinstance(values, str):
++        values = re.split(r'(?:\r?\n|<br\s*/?>)', values, flags=re.I)
++    if not isinstance(values, list):
++        values = []
++        warnings.append('사진의 유효성분 목록이 없거나 지원하지 않는 형식입니다. 확인 필요.')
++    converted = []
++    for value in values[:100]:
++        row = ingredient_row(value)
++        if row is not None:
++            converted.append(row)
++        else:
++            warnings.append('사진의 일부 성분 행을 읽지 못했습니다. 확인 필요.')
++    if len(values) > 100:
++        warnings.append('성분 목록이 100개를 초과하여 일부만 읽었습니다. 확인 필요.')
++    result['effective_ingredients'] = converted
++    cautions = pick(data, 'do_not_take_with', '중복·병용 관련 주의사항')
++    if isinstance(cautions, str):
++        cautions = [{'item_name': cautions.strip()}] if cautions.strip() else []
++    elif isinstance(cautions, list):
++        cautions = [dict(v) if isinstance(v, dict) else {'item_name': v} for v in cautions if isinstance(v, (dict,str))]
++    else:
++        cautions = []
++    result['do_not_take_with'] = cautions
++    result['schema_source'] = 'korean' if any(k in data for k in ('제품명','유효성분 목록')) else 'english'
++    if not result['product_name_raw']:
++        warnings.append('제품명을 한 개로 확인하지 못했습니다. 직접 검색하세요.')
++    warnings = list(dict.fromkeys(w for w in warnings if isinstance(w, str)))
++    result['adapter_warnings'] = warnings
++    return result, warnings
+--- original/main.py
++++ revised/main.py
+@@ -6,6 +6,8 @@
+ import json
+ import secrets
+ import webbrowser
++import hashlib
++from datetime import datetime, timezone
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from pathlib import Path
+ from urllib.parse import urlsplit
+@@ -14,10 +16,82 @@
+ from mfds_client import MFDSClient, ServiceError
+ from studio_client import analyze_photo
+ from calculator import calculate
++from workflow import AnalysisWorkflow
+ 
+ TOKEN = secrets.token_urlsafe(32)
+ ALLOWED_HOST = ''
+ STATIC = ROOT / 'static'
++WORKFLOW = AnalysisWorkflow()
++
++
++def client_revision():
++    """페이지 새로고침 때 JS/CSS 변경을 즉시 반영하기 위한 내용 기반 버전."""
++    digest = hashlib.sha256()
++    for name in ('index.html', 'app.js', 'style.css'):
++        digest.update((STATIC / name).read_bytes())
++    return digest.hexdigest()[:12]
++
++
++def status_payload():
++    """요청마다 .env 재조회. 키 값이나 과거 고정 버전은 클라이언트에 보내지 않음."""
++    conf = settings()
++    return {'mfds_ready': bool(conf.get('MFDS_SERVICE_KEY')),
++            'studio_ready': bool(conf.get('UPSTAGE_API_KEY')),
++            'agent_id': conf.get('UPSTAGE_AGENT_ID', ''),
++            'config_policy': 'latest', 'requested_config_id': None,
++            'legacy_config_ignored': bool(conf.get('UPSTAGE_CONFIG_ID', '').strip()),
++            'refresh_behavior': 'status_only', 'client_revision': client_revision(),
++            'checked_at': datetime.now(timezone.utc).isoformat(), 'token': TOKEN}
++
++
++def dispatch_post(path, data):
++    """HTTP 처리와 분리해 새 경로도 외부 API 없이 테스트할 수 있게 합니다."""
++    client = MFDSClient()
++    if path == '/api/search':
++        page = int(data.get('page', 1))
++        if not 1 <= page <= 1000:
++            raise ServiceError('페이지 범위를 확인하세요.')
++        return client.search(data.get('name', ''), page)
++    if path == '/api/detail':
++        return client.detail(data.get('code', ''))
++    if path in ('/api/studio', '/api/analyze-and-match'):
++        if data.get('consent') is not True:
++            raise ServiceError('사진의 Upstage 전송에 동의해야 분석할 수 있습니다.')
++        try:
++            content = base64.b64decode(data.get('base64', ''), validate=True)
++        except (binascii.Error, TypeError):
++            raise ServiceError('사진 데이터 형식이 잘못되었습니다.') from None
++        if not content or len(content) > 10 * 1024 * 1024:
++            raise ServiceError('사진 한 장은 10MB 이하로 입력하세요.')
++        return (WORKFLOW.analyze_and_match(content, data.get('mime', ''))
++                if path == '/api/analyze-and-match' else analyze_photo(content, data.get('mime', '')))
++    if path == '/api/match-search':
++        page = int(data.get('page', 1))
++        if not 1 <= page <= 1000:
++            raise ServiceError('페이지 범위를 확인하세요.')
++        return WORKFLOW.search_again(data.get('photo_id'), data.get('name', ''), page)
++    if path == '/api/import-and-match':
++        extracted = data.get('extracted')
++        if not isinstance(extracted, dict):
++            raise ServiceError('Extract JSON 객체가 필요합니다.')
++        return WORKFLOW.match_extracted(extracted)
++    if path == '/api/confirm-match':
++        return WORKFLOW.confirm_candidate(data.get('candidate_id'), data.get('confirmed'), data.get('mismatch_ack'))
++    if path == '/api/evaluate':
++        rules = json.loads((ROOT / 'verified_rules.json').read_text(encoding='utf-8'))
++        return WORKFLOW.evaluate(data.get('products'), data.get('mode', 'single'), rules)
++    if path == '/api/demo-evaluate':
++        # 가상 예제는 별도 경로에서 서버의 고정 데이터만 사용합니다.
++        samples = json.loads((STATIC / 'sample.json').read_text(encoding='utf-8'))
++        quantities = data.get('quantities')
++        if not isinstance(quantities, list) or len(quantities) != len(samples):
++            raise ServiceError('예제 수량을 확인하세요.')
++        for sample, quantity in zip(samples, quantities):
++            sample['quantity'] = quantity
++        result = calculate(samples, data.get('mode', 'single'), [])
++        result['demo'] = True
++        return result
++    raise ServiceError('지원하지 않는 요청입니다.')
+ 
+ 
+ class Handler(BaseHTTPRequestHandler):
+@@ -30,7 +104,9 @@
+         self.send_response(status)
+         self.send_header('Content-Type', mime)
+         self.send_header('Content-Length', str(len(raw)))
+-        self.send_header('Cache-Control', 'no-store')
++        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
++        self.send_header('Pragma', 'no-cache')
++        self.send_header('Expires', '0')
+         self.send_header('X-Content-Type-Options', 'nosniff')
+         self.send_header('Referrer-Policy', 'no-referrer')
+         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; frame-ancestors 'none'")
+@@ -46,11 +122,7 @@
+             return
+         path = urlsplit(self.path).path
+         if path == '/api/status':
+-            conf = settings()
+-            self.send(200, {'mfds_ready': bool(conf.get('MFDS_SERVICE_KEY')),
+-                            'studio_ready': bool(conf.get('UPSTAGE_API_KEY')),
+-                            'agent_id': conf.get('UPSTAGE_AGENT_ID', ''),
+-                            'config_policy': 'latest', 'token': TOKEN})
++            self.send(200, status_payload())
+             return
+         assets = {'/': ('index.html', 'text/html; charset=utf-8'),
+                   '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
+@@ -60,7 +132,13 @@
+             self.send(404, {'error': '페이지를 찾을 수 없습니다.'})
+             return
+         filename, mime = assets[path]
+-        self.send(200, (STATIC / filename).read_bytes(), mime)
++        raw = (STATIC / filename).read_bytes()
++        if path == '/':
++            revision = client_revision()
++            html = raw.decode('utf-8').replace('src="/app.js"', f'src="/app.js?v={revision}"')
++            html = html.replace('href="/style.css"', f'href="/style.css?v={revision}"')
++            raw = html.encode('utf-8')
++        self.send(200, raw, mime)
+ 
+     def do_POST(self):
+         if (not self.valid_host() or self.headers.get('Origin') != 'http://' + ALLOWED_HOST
+@@ -75,28 +153,7 @@
+             if not isinstance(data, dict):
+                 raise ServiceError('요청 형식을 확인하세요.')
+             path = urlsplit(self.path).path
+-            client = MFDSClient()
+-            if path == '/api/search':
+-                page = int(data.get('page', 1))
+-                if not 1 <= page <= 1000:
+-                    raise ServiceError('페이지 범위를 확인하세요.')
+-                result = client.search(data.get('name', ''), page)
+-            elif path == '/api/detail':
+-                result = client.detail(data.get('code', ''))
+-            elif path == '/api/studio':
+-                if data.get('consent') is not True:
+-                    raise ServiceError('사진의 Upstage 전송에 동의해야 분석할 수 있습니다.')
+-                try:
+-                    content = base64.b64decode(data.get('base64', ''), validate=True)
+-                except (binascii.Error, TypeError):
+-                    raise ServiceError('사진 데이터 형식이 잘못되었습니다.') from None
+-                result = analyze_photo(content, data.get('mime', ''))
+-            elif path == '/api/evaluate':
+-                rules = json.loads((ROOT / 'verified_rules.json').read_text(encoding='utf-8'))
+-                result = calculate(data.get('products'), data.get('mode', 'single'), rules)
+-            else:
+-                self.send(404, {'error': '지원하지 않는 요청입니다.'})
+-                return
++            result = dispatch_post(path, data)
+             self.send(200, result)
+         except ServiceError as error:
+             self.send(400, {'error': str(error)})
+@@ -111,7 +168,7 @@
+     parser = argparse.ArgumentParser(description='러닝플로우 약품 성분 확인')
+     parser.add_argument('--no-browser', action='store_true')
+     args = parser.parse_args()
+-    port = int(settings().get('PORT', '8766'))
++    port = int(settings().get('PORT', '8767'))
+     ALLOWED_HOST = f'127.0.0.1:{port}'
+     try:
+         server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+--- original/matcher.py
++++ revised/matcher.py
+@@ -0,0 +1,176 @@
++"""사진 Extract와 공식 주성분을 대조. 추측·동의어 치환·부동소수점 허용오차 없음."""
++import json
++import re
++from decimal import Decimal
++
++from calculator import to_mg, number
++from mfds_client import ServiceError
++from normalization import normalize_name
++
++UNITS = {'mg': 'mg', '밀리그램': 'mg', 'g': 'g', '그램': 'g',
++         'μg': 'μg', 'µg': 'μg', 'ug': 'μg', 'mcg': 'μg', '마이크로그램': 'μg'}
++UNIT_PATTERN = '|'.join(sorted(map(re.escape, UNITS), key=len, reverse=True))
++BASIS = r'(?P<basis>[0-9]+(?:\.[0-9]+)?)\s*(?P<basis_unit>정|캡슐|포|mL|ml)'
++STRENGTH = re.compile(r'^\s*(?:' + BASIS + r'\s*중\s*)?(?P<amount>[0-9]+(?:\.[0-9]+)?)\s*'
++                      r'(?P<unit>' + UNIT_PATTERN + r')\s*$', re.I)
++
++
++def text(value):
++    return value.strip() if isinstance(value, str) else ''
++
++
++def parse_strength(value):
++    result = {'raw': text(value), 'mg': None, 'amount': None, 'unit': None,
++              'basis_quantity': None, 'basis_unit': None, 'status': '함량 미확인'}
++    if not isinstance(value, str) or len(value) > 300:
++        return result
++    match = STRENGTH.fullmatch(value)
++    if not match:
++        return result
++    groups = match.groupdict()
++    raw_unit = groups['unit'].lower()
++    unit = UNITS.get(raw_unit)
++    try:
++        if not unit:
++            return result
++        mg = to_mg(groups['amount'], unit)
++        basis = number(groups['basis'], '기준 수량') if groups['basis'] else None
++    except ServiceError:
++        return result
++    result.update(mg=str(mg), amount=groups['amount'], unit=unit, status='확인됨',
++                  basis_quantity=str(basis) if basis is not None else None,
++                  basis_unit='mL' if str(groups['basis_unit']).lower() == 'ml' else groups['basis_unit'])
++    return result
++
++
++def parse_basis(value):
++    """명시된 1정/100mL 등만 사용. 1정(총량 700mg) 중 표현도 처리."""
++    value = text(value)
++    pattern = r'([0-9]+(?:\.[0-9]+)?)\s*(정|캡슐|포|mL|ml)(?:\s*\([^()]*\))?\s*(?:중|당)'
++    found = re.findall(pattern, value, re.I)
++    if not found:
++        exact = re.fullmatch(r'\s*([0-9]+(?:\.[0-9]+)?)\s*(정|캡슐|포|mL|ml)\s*', value, re.I)
++        found = [exact.groups()] if exact else []
++    normalized = {(str(Decimal(q)), 'mL' if u.lower() == 'ml' else u) for q, u in found}
++    if len(normalized) != 1:
++        return None, None
++    quantity, unit = normalized.pop()
++    try:
++        return str(number(quantity, '공식 기준 수량')), unit
++    except ServiceError:
++        return None, None
++
++
++def photo_ingredients(extracted):
++    extracted = extracted if isinstance(extracted, dict) else {}
++    values = extracted.get('effective_ingredients')
++    if not isinstance(values, list):
++        return []
++    result = []
++    for row in values[:100]:
++        if not isinstance(row, dict):
++            continue
++        name = text(row.get('ingredient_name')) or text(row.get('base_ingredient_name'))
++        aliases = {normalize_name(row.get('ingredient_name')), normalize_name(row.get('base_ingredient_name'))} - {''}
++        result.append({'name': name, 'aliases': sorted(aliases),
++                       'strength': parse_strength(row.get('strength_per_unit')), 'raw': row})
++    return result
++
++
++def official_ingredients(detail):
++    product = detail.get('product') if isinstance(detail.get('product'), dict) else {}
++    values = detail.get('ingredients_raw')
++    result = []
++    for row in values if isinstance(values, list) else []:
++        if not isinstance(row, dict):
++            continue
++        name = text(row.get('MTRAL_NM'))
++        qnt, raw_unit = row.get('QNT'), text(row.get('INGD_UNIT_CD'))
++        qnt = str(qnt) if isinstance(qnt, (str, int, float)) and not isinstance(qnt, bool) else ''
++        strength = parse_strength(qnt + raw_unit)
++        # 코드형 단위나 불명확한 분량은 원문을 임의 해석하지 않음.
++        bases = [parse_basis(row.get('CPNT_CTNT_CONT')), parse_basis(product.get('TOTAL_CONTENT'))]
++        known = {b for b in bases if b[0] is not None}
++        basis = next(iter(known)) if len(known) == 1 else (None, None)
++        result.append({'name': name, 'normalized_name': normalize_name(name),
++                       'ingredient_code': text(row.get('MTRAL_CODE')),
++                       'strength': strength, 'basis_quantity': basis[0], 'basis_unit': basis[1], 'raw': row})
++    return result
++
++
++def compare_ingredients(extracted, detail):
++    photos, official = photo_ingredients(extracted), official_ingredients(detail)
++    remaining = set(range(len(official)))
++    rows, warnings = [], list(detail.get('warnings') or [])
++    for photo in photos:
++        matches = [i for i in remaining if official[i]['normalized_name']
++                   and official[i]['normalized_name'] in photo['aliases']]
++        if len(matches) != 1:
++            rows.append({'name': photo['name'] or '성분명 미확인', 'status': '사진에만 있음',
++                         'photo': photo, 'official': None})
++            if len(matches) > 1:
++                warnings.append('동일 이름의 공식 성분 행이 여러 개입니다. 확인 필요.')
++            continue
++        i = matches[0]; remaining.remove(i); target = official[i]
++        a, b = photo['strength'], target['strength']
++        status = '함량 미확인'
++        if a['mg'] is not None and b['mg'] is not None:
++            # 양쪽에 기준이 명시되면 기준 수량당 mg로 비교. 기준 단위가 다르면 비교 불가.
++            if a['basis_quantity'] and target['basis_quantity']:
++                if a['basis_unit'] == target['basis_unit']:
++                    amg = Decimal(a['mg']) / Decimal(a['basis_quantity'])
++                    bmg = Decimal(b['mg']) / Decimal(target['basis_quantity'])
++                    status = '일치' if amg == bmg else '함량 불일치'
++            elif ((a['basis_quantity'] and Decimal(a['basis_quantity']) != 1)
++                  or (target['basis_quantity'] and Decimal(target['basis_quantity']) != 1)):
++                # 어느 쪽이든 비단위 기준인데 상대 기준이 없으면 같은 분모라고 가정하지 않음.
++                status = '함량 미확인'
++            else:
++                status = '일치' if Decimal(a['mg']) == Decimal(b['mg']) else '함량 불일치'
++        rows.append({'name': target['name'], 'status': status, 'photo': photo, 'official': target})
++    for i in sorted(remaining):
++        rows.append({'name': official[i]['name'] or '성분명 미확인', 'status': '공식에만 있음',
++                     'photo': None, 'official': official[i]})
++    raw_photo_rows = extracted.get('effective_ingredients') if isinstance(extracted, dict) else None
++    malformed_photo = (not isinstance(raw_photo_rows, list) or len(raw_photo_rows) > 100
++                       or any(not isinstance(r, dict) for r in raw_photo_rows))
++    if malformed_photo:
++        warnings.append('사진의 성분 목록 형식이 불완전합니다. 확인 필요.')
++    all_match = bool(rows) and all(r['status'] == '일치' for r in rows) and not malformed_photo
++    calculation_ready = bool(official) and all(o['name'] and o['strength']['mg'] is not None
++                                             and o['basis_quantity'] and o['basis_unit'] for o in official)
++    if not calculation_ready:
++        warnings.append('공식 성분·함량·함량 기준을 완전히 확인하지 못했습니다. 계산 추가 차단.')
++    if len({(o['ingredient_code'] or o['normalized_name']) for o in official}) != len(official):
++        calculation_ready = False
++        warnings.append('공식 성분이 중복된 행으로 반환되었습니다. 계산 추가 차단.')
++    if detail.get('warnings'):
++        calculation_ready = False
++    return {'status': '일치' if all_match else '확인 필요', 'all_match': all_match,
++            'rows': rows, 'official_ingredients': official, 'calculation_ready': calculation_ready,
++            'warnings': warnings}
++
++
++def manufacturer_matches(photo_name, official_name):
++    a, b = normalize_name(photo_name), normalize_name(official_name)
++    return bool(a and b and a == b)
++
++
++def official_calculation_product(detail, comparison, extracted):
++    """계산값은 공식 데이터에서만 생성. 사진은 evidence 안에만 남김."""
++    if not comparison.get('calculation_ready'):
++        raise ServiceError('공식 함량 또는 기준 단위가 미확인입니다. 확인 필요.')
++    product = detail['product']
++    ingredients = []
++    for o in comparison['official_ingredients']:
++        ingredients.append({'name': o['name'], 'ingredient_code': o['ingredient_code'],
++                            'amount': o['strength']['amount'], 'unit': o['strength']['unit'],
++                            'basis_quantity': o['basis_quantity'], 'basis_unit': o['basis_unit'],
++                            'evidence': json.dumps({'official': o['raw'], 'photo': extracted}, ensure_ascii=False)})
++    units = {i['basis_unit'] for i in ingredients}
++    if len(units) != 1:
++        raise ServiceError('공식 성분의 기준 단위가 다릅니다. 확인 필요.')
++    return {'name': text(product.get('ITEM_NAME')), 'code': str(product.get('ITEM_SEQ', '')),
++            'quantity': '0', 'quantity_unit': next(iter(units)), 'confirmed': True,
++            'source': detail.get('source', ''), 'ingredients': ingredients,
++            'warning_text': text(product.get('NB_DOC_DATA')), 'directions_text': text(product.get('UD_DOC_DATA'))}
+--- original/mfds_client.py
++++ revised/mfds_client.py
+@@ -140,10 +140,13 @@
+         except (URLError, TimeoutError, socket.timeout, ssl.SSLError):
+             raise ServiceError('식약처 API에 연결하지 못했습니다. 인터넷 연결 또는 API 점검 상태를 확인하세요.') from None
+ 
+-    def search(self, name, page=1):
++    def search(self, name, page=1, manufacturer=None, page_size=50):
+         if not isinstance(name, str) or not name.strip() or len(name) > 150:
+             raise ServiceError('제품명을 1~150자로 입력하세요.')
+-        return self.query('getDrugPrdtPrmsnInq08', item_name=name.strip(), pageNo=page)
++        params = {'item_name': name.strip(), 'pageNo': page, 'numOfRows': page_size}
++        if isinstance(manufacturer, str) and manufacturer.strip():
++            params['entp_name'] = manufacturer.strip()
++        return self.query('getDrugPrdtPrmsnInq08', **params)
+ 
+     def detail(self, code):
+         if not isinstance(code, str) or not code.isdigit() or len(code) > 20:
+--- original/normalization.py
++++ revised/normalization.py
+@@ -0,0 +1,13 @@
++"""표기만 정리합니다. 염형·동의어·다른 화학명은 변환하지 않습니다."""
++import re
++import unicodedata
++
++STANDARD = re.compile(r'^(?:kp|usp(?:-?nf)?|ep|bp|jp|ph\.?eur\.?|별규|약전|규격)[\s.\-\d]*$', re.I)
++
++
++def normalize_name(value):
++    if not isinstance(value, str):
++        return ''
++    value = unicodedata.normalize('NFKC', value).lower()
++    value = re.sub(r'\(([^()]*)\)', lambda m: '' if STANDARD.fullmatch(m.group(1).strip()) else m.group(0), value)
++    return re.sub(r'\s+', '', value)
+--- original/README.md
++++ revised/README.md
+@@ -1,89 +1,87 @@
+-# 러닝플로우 — 일반의약품 성분 확인
++# 러닝플로우 사진 성분 자동 대조 수정본
+ 
+-Python 3.11 이상만 있으면 실행하는 로컬 웹 앱입니다. **외부 패키지 설치가 필요 없습니다.** VS Code에서 이 폴더 또는 `learningflow.code-workspace`를 열어 작업하세요.
++## 현재 Agent 출력 호환 업데이트
+ 
+-## 1. 인증키 입력
+-이 폴더의 `.env` 파일을 열어 다음 값을 입력하고 저장합니다. 키를 따옴표로 감싸지 않아도 됩니다.
++Studio 링크에서 확인 가능한 설정 #7의 저장 결과가 `제품명`, `유효성분 목록`, `성인 용법·용량`, `하루 최대량`, `중복·병용 관련 주의사항` 형식이어서 `extraction_adapter.py`를 추가했습니다. 기존 영문 스키마와 한국어 스키마를 모두 지원합니다. `아세트아미노펜 / 500 / mg / 1정` 같은 원문을 의미 변경 없이 `1정 중 500 mg`으로 연결합니다. 원문은 `raw_extracted`와 성분별 `source_raw`에 보존합니다.
++
++사진 분석 후 홈페이지에 제품명·제조사·성분·성인 용법용량·하루 최대량·병용 주의사항이 표로 표시됩니다. 이 표는 **사진 추출값**이며 공식 데이터와 구분됩니다. 응답에 실제 설정 번호가 없으면 버전을 확인했다고 표시하지 않습니다. Agent를 수정한 뒤 새로 분석해야 하고, Python 코드 수정 후에는 서버 재시작과 페이지 새로고침이 필요합니다.
++
++검증: 기존 테스트와 한국어 출력 호환 사례를 포함한 Python 테스트 93개 및 JavaScript 화면 흐름 검사가 통과했습니다. 이 업데이트의 Studio 재호출에는 실제 사진을 전송하지 않았으며, 확인 가능한 저장 결과를 테스트 픽스처로 사용했습니다.
++
++기존 `learningflow-med-python`을 변경하지 않고 만든 별도 프로젝트입니다. Python 3.11 이상과 표준 라이브러리만 사용합니다. Node.js는 개발용 JavaScript 테스트를 실행할 때만 선택적으로 사용합니다.
++
++## 실행
++
++1. 이 폴더를 VS Code로 열거나 `learningflow.code-workspace`를 엽니다.
++2. `.env`에 자신의 식약처 인증키와 Upstage 키를 입력합니다. 실제 인증키는 원본에서 복사하지 않았습니다. 압축본에는 `.env`를 넣지 않았으므로 `.env.example`을 복사해 만드세요.
++3. 터미널에서 `python main.py`를 실행합니다.
++4. 기본 주소는 **http://127.0.0.1:8767**입니다. 원본의 8766과 다릅니다. 종료는 Ctrl+C입니다.
+ 
+ ```dotenv
+-MFDS_SERVICE_KEY=공공데이터포털_일반인증키_Decoding
+-UPSTAGE_API_KEY=사진분석을_사용할_때만_입력
++MFDS_SERVICE_KEY=
++UPSTAGE_API_KEY=
+ UPSTAGE_AGENT_ID=agt_ZFvwgYPuoG7ppQanNZhNqL
++MFDS_BASE_URL=https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService08
++PORT=8767
+ ```
+ 
+-- 식약처 키만 입력해도 **제품명 검색 → 공식 제품 선택 → 주성분 정보 조회**를 사용할 수 있습니다.
+-- `식품의약품안전처_의약품 제품 허가정보` 활용신청 승인이 필요합니다. 키가 존재하는 것만으로 API 접근이 승인되는 것은 아닙니다.
+-- Upstage 키는 Studio 사진 분석 시에만 필요합니다. 기존 Agent ID를 설정해 두었습니다. 계정에서 해당 Agent를 API로 실행할 권한이 있어야 합니다.
+-- 현재 최종 Instruct가 표를 출력하면 표 원문을 보여줍니다. 제품명 자동 채우기는 최종 결과가 제품명 필드를 포함한 JSON일 때 지원합니다. 자동 채우기가 안 되면 검색창에 직접 입력하면 됩니다. Studio 설정은 수정하지 않았습니다.
+-- **최신 설정 자동 적용:** 매번 작업 생성 시 `config_id`를 생략합니다. 공식 명세에 따라 최신 설정 버전이 사용됩니다. Studio에서 설정을 수정한 후 한 번 실행해 초안을 확정한 다음 사이트에서 ‘최신 에이전트로 사진 분석 / 재분석’을 누르세요. 같은 사진도 다시 분석할 수 있고 매번 API 사용량이 발생합니다. 기존 결과를 자동 재처리하거나 사진을 백그라운드로 전송하지 않습니다. Agent를 복제한 경우에는 새 Agent ID로 변경해야 합니다. 추출 필드 이름 변경 시 사이트 해석 코드 수정이 필요할 수 있습니다.
+-- 키가 들어간 `.env`는 `.gitignore`에서 제외했습니다. 키를 채팅·GitHub·화면 캡처에 공개하지 마세요.
+-- `.env`는 요청 때 다시 읽습니다. 키를 저장한 뒤 페이지를 새로고침하면 상태가 갱신됩니다. PORT 변경만 서버 재시작이 필요합니다.
++수정본은 요청에 따라 키를 **이 폴더의 .env에서만** 읽습니다. 운영체제 환경변수로 덮어쓰지 않습니다. `UPSTAGE_CONFIG_ID`가 남아 있거나 값이 있어도 무시하고 항상 최신 확정 설정만 요청합니다. 상태 화면에 정책과 확인 시각을 표시합니다. 새로고침은 설정 상태만 갱신하고 사진은 분석 버튼을 눌렀을 때만 전송합니다.
+ 
+-## 2. 실행
+-VS Code에서 **터미널 → 새 터미널**을 열어 프로젝트 폴더 안에서 실행합니다.
++## 새 흐름
+ 
+-```powershell
+-python main.py
+-```
++사진 분석 → Extract 결과 선택 → 제품명으로 식약처 검색 → 후보마다 공식 상세·주성분 조회 → 성분·함량 대조 → 후보 정렬 → 사용자가 후보 선택 → 공식 정보 확인 → 불일치가 있으면 추가 확인 → 공식 값으로 계산 목록 추가 → 가정 수량 합산.
+ 
+-자동으로 열리는 주소: **http://127.0.0.1:8766**
++- 후보는 제조사 이름 정규화 일치가 먼저이고, 다음으로 전체 성분과 함량 일치가 먼저입니다. 자동으로 제품을 선택하지 않습니다.
++- 자동 대조는 한 페이지 10개 후보입니다. 더 있으면 다음 페이지/직접 재검색을 사용합니다. 검색 1회+후보별 보통 2회 조회이므로 10개 후보 평가에 최대 21회 요청이 발생할 수 있습니다. 실제 응답·실패에 따라 다릅니다. 캐시는 없습니다.
++- 직접 검색도 이전 사진 추출값을 유지합니다. 사진 분석 실패와 검색 결과 없음은 서로 구분됩니다. 기존 JSON도 가져올 수 있습니다.
++- 성분명에서는 공백·영문 대소문자와 KP/USP/EP 등 규격 괄호를 정리합니다. 염형이나 서방형처럼 의미 있는 괄호 내용은 보존하고, 동의어는 추측하지 않습니다.
++- `500mg`, `500 밀리그램`, `0.5g`, `1정 중 500mg` 등 지원 형식만 파싱합니다. 지원하지 않는 숫자·단위·혼합 표현은 미확인으로 처리합니다.
++- 공식 단위 코드의 뜻을 추정하지 않습니다. 공식 `QNT`·`INGD_UNIT_CD`로 함량을 해석할 수 있고, `CPNT_CTNT_CONT` 또는 `TOTAL_CONTENT`에 명시된 함량 기준이 있어야 계산 목록에 추가할 수 있습니다. 미확인 제품은 두 번 확인해도 추가할 수 없습니다.
++- 확인된 계산 데이터는 서버 메모리에 저장하고, 계산 요청은 승인 ID와 수량만 받습니다. 브라우저가 다른 함량을 보내더라도 공식 스냅샷의 값으로 계산합니다. 확인 정보는 최대 30분 또는 서버 재시작 전까지 유효합니다.
++- 분석이 성공·실패·시간초과해도 업로드 파일 ID를 받았다면 finally에서 삭제를 시도합니다. 삭제 실패는 분석 결과 경고 또는 서버의 일반 경고만 남기며 키/URL/원래 예외 내용을 기록하지 않습니다.
+ 
+-브라우저를 직접 열려면 `python main.py --no-browser`를 실행하세요. 종료는 터미널에서 Ctrl+C. 포트 충돌 시 `.env`의 PORT를 바꾸세요. 개인 PC에서만 사용하도록 127.0.0.1에 바인딩합니다. 서버 코드를 공개 인터넷에 그대로 배포하지 마세요. 외부 배포에는 인증·업로드 저장 정책·작업 관리가 추가로 필요합니다.
++## 파일과 출력 설명
+ 
+-## 3. 사용 순서
+-1. 키 없이 확인하려면 ‘가상 예제로 체험’을 눌러 가상 제품별 수량을 입력하고 합산합니다. 실제 약이나 임상 기준을 사용하지 않는 예제입니다.
+-2. 실제 데이터는 제품명 검색 → 후보에서 제조사·함량·제형을 확인하여 선택합니다. 전체 이름이 사진과 다르거나 후보가 여럿이면 임의 선택하지 않습니다.
+-3. 공식 원료·주성분 원문, 용법용량, 주의사항을 확인합니다. 함량 단위가 코드로 반환될 경우 자동 해석하지 않습니다.
+-4. 성분별 함량·단위·함량 기준(예: 1정, 100mL)을 원문과 대조해 입력합니다. 공식 성분코드가 있으면 그대로 사용합니다. 주성분 누락이나 첨가제 포함 여부를 점검하세요.
+-5. 같은 제품의 추가 사진은 해당 제품 확인 화면에서 파일명·해시를 연결해 관리합니다. 추가 사진은 자동 분석/영구 저장하지 않습니다. 사진 한 장의 Studio 분석은 별도의 분석/재분석 버튼을 사용합니다. 동일 사진은 연결 목록에서는 중복 제외하지만 Studio에는 최신 설정으로 다시 요청할 수 있습니다.
+-6. 원문 대조 확인 후 계산 목록에 넣습니다. 1회 또는 1일 총량 가정을 고르고 제품별 수량을 직접 입력합니다. 기본 수량은 0입니다.
+-7. 성분량·중복·확인하지 않은 조건·공식 주의 원문을 보고 필요 시 결과 JSON을 내려받습니다.
++- `matcher.py`: 함량 파싱, 공식 성분 변환, 상태 대조, 공식 계산 제품 생성.
++- `normalization.py`: 이름 정규화 공통 함수. 계산/대조의 순환 참조 방지.
++- `workflow.py`: 후보 정렬, 메모리 확인 상태, 공식 데이터 계산 경계.
++- `studio_client.py`: 전체 노드 결과와 Extract 우선 선택, 설정 버전 정책, 파일 삭제.
++- `mfds_client.py`: 기존 기능 유지, 제조사 필터/페이지 크기 옵션 추가.
++- `main.py`: `/api/analyze-and-match`, `/api/match-search`, `/api/import-and-match`, `/api/confirm-match` 추가. 요청 분기를 테스트 가능한 `dispatch_post()`로 분리.
++- `calculator.py`: `to_mg()` 공통 환산, 코드 없는 이름 정규화 합산, 규칙의 선택적 product_codes.
++- `static/`: 후보별 대조 표, 상태별 색과 텍스트, 선택·두 번째 확인·공식값 계산.
++- `docs/수정본_전체코드와테스트.md`: 요청한 5개 항목 형식의 파일별 코드, 테스트, 설정, 확인 방법.
++- `docs/원본대비변경.patch`: 원본과 수정본의 텍스트 차이.
+ 
+-## 4. 현재 구현된 범위
+-- 식약처 Service08 공식 목록/상세/주성분 조회(검색 결과 페이지 이동 포함).
+-- 사진 한 장씩 Upstage Files API 업로드와 Agent 비동기 실행, 최종 결과 표시.
+-- 기존 Studio JSON 가져오기 및 제품명 검색 연결.
+-- 같은 제품 사진 연결 기록, 분석 사진 중복 검사, 제품 중복 추가 차단.
+-- 함량 기준·단위·수량·근거 확인, g/mg/μg 변환, 성분별 합산(Decimal 계산).
+-- 공식 성분코드가 있으면 코드로, 없으면 정확한 표기명으로만 묶음. 유사한 이름/염형을 추측해서 합치지 않음.
+-- 제품별 주의사항 원문을 합산 결과와 별도로 표시. 병용금기 여부 자동 판정은 미구현.
+-- 서버 로컬 검토 규칙과 비교하는 계산 경로. 기본 `verified_rules.json`은 빈 목록이므로 실제 용량 초과 여부는 모두 **기준 미등록·미판정**으로 표시합니다.
+-- 입력이 바뀌면 기존 결과/다운로드를 무효화합니다. 개인 복용 이력은 보관하지 않습니다.
+-
+-## 5. 검증된 용량 기준 연결은 후속 작업
+-공식 성분/함량 조회 데이터와 ‘성분별 최대량 규칙’은 서로 다릅니다. 이 앱은 최대량을 AI나 제품명만으로 추정하지 않습니다. 지원 제품별 허가 원문과 적용 조건을 약사와 확인한 후 로컬 `verified_rules.json`에 검토 완료 규칙을 등록해야 합니다.
+-
+-규칙 필드: `id`, `ingredient_code`, `mode`(`single` 또는 `day`), `population`(`adult`), `product_codes`(적용 제품의 정확한 품목기준코드 목록), `limit_mg`, `reviewed`(true), `reviewer`, `reviewed_at`, `source_url`.
+-
+-처음에는 제품의 제형·투여경로·함량·성인 조건이 모두 검토된 품목만 product_codes에 넣으세요. 이 규칙 모델은 **가정 시나리오의 용량 비교 전용**입니다. 복용 간격·실제 누적 기록·질환·임신 등 조건부 개인 용량은 평가하지 않습니다. 조건을 단순화할 수 없는 제품에는 규칙을 등록하지 말고 미판정으로 두세요. 클라이언트 입력으로 최대량을 설정할 수 없고, 적용 규칙이 없거나 여러 개 충돌하면 판단을 유보합니다. 테스트의 기준 수치는 가상 계산 검증용이며 임상 기준이 아닙니다.
+-
+-## 6. 검증
+-403 원인을 확인하려면 `python diagnose_mfds.py`를 실행하세요. 키를 출력하지 않고 공식 API에 1회 요청합니다. 오류 30은 등록되지 않은 키, 20은 인증/접근 권한, 22는 일일 호출 한도입니다. .env에 공공데이터포털의 일반 인증키를 입력하고 해당 서비스 활용신청 승인을 확인하세요. 단순 HTTP 403만으로 한도 초과라고 판단하지 않습니다.
++## 테스트
+ 
+ ```powershell
+ python -m unittest discover -s tests -v
++node tests/test_ui.cjs
+ ```
+-단위 변환, 2정/액상 기준, 결측·NaN·차원 불일치·중복 차단, 규칙 적용 범위, JSON/XML 응답과 인증 오류를 검사합니다. 실제 인증키는 비워 두었으므로 실제 식약처/Upstage 호출 성공은 키 입력 후 확인해야 합니다.
+ 
+-## 파일 안내
+-- `main.py`: 로컬 웹 서버, 요청 경계, 전송 동의·Origin·로컬 토큰 검사
+-- `mfds_client.py`: 식약처 검색/상세/성분 조회 및 오류 처리
+-- `studio_client.py`: Upstage 사진 분석
+-- `calculator.py`: 입력 검증·단위 변환·성분 합산·등록 규칙 비교
+-- `static/`: 한국어 웹 화면
+-- `config.py`, `.env`: 설정 읽기와 비밀값 보관
+-- `verified_rules.json`: 기본 비어 있는 검토 완료 기준 저장소
+-- `tests/`: 네트워크와 실제 키를 사용하지 않는 테스트
++외부 API는 가짜 응답으로 대체합니다. 실제 키와 사진은 테스트에 사용하지 않습니다. `test_ui.cjs`는 최소 DOM과 가짜 fetch로 후보 선택, 추가 확인, 공식값 사용, 계산 요청 경계와 결과 무효화를 검사합니다. 실제 브라우저의 화면 배치 검사는 별도입니다.
+ 
+-## 공식 명세 확인 기록
+-- 2026-10-15 공공데이터포털 Swagger에서 Service08 확인:
+-  https://www.data.go.kr/data/15095677/openapi.do
+-- `getDrugPrdtPrmsnInq08`: `item_name`, `pageNo` 검색.
+-- `getDrugPrdtPrmsnDtlInq08`: `item_seq` 상세 조회.
+-- `getDrugPrdtMcpnDtlInq08`: `Item_seq` 주성분 조회(대소문자 차이 주의).
+-- 주성분 응답: `MTRAL_NM`, `QNT`, `INGD_UNIT_CD`, `CPNT_CTNT_CONT`, `MTRAL_CODE` 등. 실제 응답 단위·기준의 의미가 명확하지 않으면 수동 확인.
+-- Upstage: https://console.upstage.ai/docs/agents
+-  `https://api.upstage.ai/v2/files`, `/responses`, `/responses/{id}`.
+-  현재 API 안내의 기본 Agent 실행 경로를 사용합니다. `config_id` 생략 시 최신 버전 사용: https://console.upstage.ai/api/agents/jobs/create-job
+-- Playbook: https://ku-sejong-hackathon-playbook.vercel.app/#sec6-1
+-  화면과 서비스/에이전트 호출의 책임을 나누는 구조를 따릅니다.
++### 기존 27개 테스트에 대한 변경 기록
++
++원본 폴더의 27개 테스트는 수정하지 않았으며 그대로 통과합니다. 수정본에는 기존 테스트 함수 27개를 유지했지만 새 요구사항과 충돌하는 두 검사의 데이터/기대값을 변경했습니다.
++
++1. `test_synonyms_not_guessed`: 공백 차이는 이제 합쳐야 하므로, 합치면 안 되는 다른 염형 데이터로 검사 대상을 바꿨습니다.
++2. `test_each_analysis_creates_new_job`: 초기 수정본에서는 설정 ID 고정을 검사했으나, 최신 요구사항에 따라 설정 ID가 있어도 무시하고 매번 최신 설정으로 새 작업을 생성하며 DELETE를 수행하는 정책을 검사합니다.
++
++두 검사를 원래 기대값 그대로 유지하면서 새 요구사항까지 만족시키는 것은 서로 모순됩니다. 이 변경을 숨기지 않고 원본 보존·별도 수정본·변경 패치로 제공했습니다.
++
++## 남은 한계
++
++- `verified_rules.json`은 빈 배열입니다. 최대량 API/DUR 자동 조회와 개인별 판단은 구현하지 않았습니다.
++- product_codes가 없거나 []이면 검토된 성분코드 규칙을 제품 범위 제한 없이 적용합니다. 제형·경로·조건별 검토 책임은 규칙 작성자에게 있습니다. 성분코드 없는 항목에 규칙을 이름만으로 적용하지 않습니다.
++- 코드가 있는 성분은 코드로, 코드 없는 성분끼리는 정규화한 이름으로 묶습니다. 코드가 있는 행과 없는 행을 이름으로 강제 연결하지는 않습니다. 이름이 같아도 염형·역가 등 생물학적 동등성은 별도로 검토해야 합니다.
++- 공식 기준 수량이나 단위가 불명확한 API 응답은 자동 계산하지 않습니다. 규격 코드 해석이나 자유 서술의 복잡한 성분표 해석은 후속 작업입니다.
++- 사진에서 기준 수량이 없으면 nominal 함량만 비교합니다. 명시된 기준이 1 이외인데 상대 기준이 없거나 단위가 다르면 함량 미확인입니다. 성분 대조 일치는 제품 전체 동일성 보장이 아니므로 제조사·제형을 사람이 확인해야 합니다.
++- 후보 상세 요청은 순차 실행이므로 후보가 많으면 오래 걸릴 수 있습니다. 네트워크 캐시·백그라운드 작업·배포용 인증은 범위 밖입니다.
++- 삭제 요청은 시도이며 삭제 실패/작업 시간초과 때 Studio에서 파일과 작업 상태를 별도로 확인해야 합니다. 파일 ID를 받기 전 네트워크가 끊겼으면 삭제할 ID를 알 수 없습니다.
++- 실제 API 호출 성공과 실제 사진 추출 정확도는 사용자가 키를 넣은 뒤 확인해야 합니다. 기존 Agent의 Extract 키를 이 요청의 스키마와 맞춰야 합니다.
++
++## 항상 최신 버전과 새로고침 정책
++
++`build_job_payload()`는 config_id를 절대 전송하지 않습니다. 호환용 인자를 넘기거나 .env에 과거 번호가 있어도 무시합니다. Studio에서 수정 후 한 번 실행해 버전을 확정하면 다음 분석 버튼 요청에 적용됩니다. 홈페이지 새로고침은 GET /api/status로 .env를 다시 읽고 확인 시각을 표시합니다. 외부 분석 요청은 하지 않습니다. HTML·JS·CSS에는 캐시 금지 헤더를 사용하고, JS/CSS URL에는 파일 내용으로 만든 버전값을 붙입니다. 파일이 바뀌면 새로고침 시 새 화면 자원을 받습니다. 기존 결과 자체는 사진을 다시 분석해야 갱신됩니다.
+--- original/static/app.js
++++ revised/static/app.js
+@@ -1,23 +1,198 @@
+-const $=s=>document.querySelector(s);let token='',chosen=null,basket=[],lastReport=null,photoRecords=[],queryName='',page=1,total=0,busy=false;
+-const e=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+-const say=t=>$('#status').textContent=t;
+-function invalidate(){lastReport=null;$('#download').disabled=true;$('#scenarioConsent').checked=false;$('#result').textContent='입력이 변경되었습니다. 가정을 확인하고 다시 계산하세요.'}
+-async function api(path,data){if(busy)throw Error('진행 중인 요청이 끝난 후 다시 시도하세요.');busy=true;say('처리 중입니다…');document.querySelectorAll('button').forEach(b=>{b.dataset.wasDisabled=String(b.disabled);b.disabled=true});try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-App-Token':token},body:JSON.stringify(data)});const d=await r.json();if(!r.ok)throw Error(d.error||'요청 실패');say('처리를 완료했습니다.');return d}finally{busy=false;document.querySelectorAll('button').forEach(b=>{b.disabled=b.dataset.wasDisabled==='true'})}}
+-async function start(){try{const r=await fetch('/api/status');const s=await r.json();token=s.token;$('#connection').textContent='식약처 키: '+(s.mfds_ready?'입력됨 (실제 권한은 조회 시 확인)':'미입력 — .env에 MFDS_SERVICE_KEY 입력')+' / Studio 키: '+(s.studio_ready?'입력됨':'미입력 — 사진 분석 시에만 필요')+' / 에이전트: 최신 설정 자동 적용'}catch{say('Python 서버 연결을 확인해 주세요.')}}start();
+-function getName(obj){if(!obj||typeof obj!=='object')return '';const v=obj['제품명']??obj.product_name;return typeof v==='string'?v:Array.isArray(v)&&typeof v[0]==='string'?v[0]:''}
+-function displayStudio(result){$('#studioResult').textContent=JSON.stringify(result,null,2);const name=getName(result.extracted??result);if(name)$('#query').value=name;say(name?'제품명을 검색창에 채웠습니다. 식약처 검색 후 정확한 제품을 선택하세요.':'결과 원문을 확인하고 제품명을 직접 입력해 주세요.')}
+-async function photoHash(file){return [...new Uint8Array(await crypto.subtle.digest('SHA-256',await file.arrayBuffer()))].map(x=>x.toString(16).padStart(2,'0')).join('')}
+-function validatePhoto(f){if(!f||!['image/jpeg','image/png','image/webp'].includes(f.type)||f.size>10*1024*1024)throw Error('JPG·PNG·WEBP 사진(10MB 이하)을 선택하세요.')}
+-$('#analyze').onclick=async()=>{try{const f=$('#image').files[0];validatePhoto(f);if(!$('#consent').checked)throw Error('사진 전송 동의란을 먼저 확인해 주세요.');const hash=await photoHash(f);const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result.split(',')[1]);r.onerror=reject;r.readAsDataURL(f)});const result=await api('/api/studio',{base64:data,mime:f.type,consent:true});const existing=photoRecords.find(p=>p.hash===hash);if(existing)Object.assign(existing,{analyzed:true,result});else photoRecords.push({name:f.name,hash,result,analyzed:true});displayStudio(result)}catch(err){say(err.message)}};
+-$('#jsonImport').onchange=async ev=>{try{const f=ev.target.files[0];if(!f)return;if(f.size>1024*1024)throw Error('JSON은 1MB 이하로 입력하세요.');displayStudio(JSON.parse(await f.text()))}catch(err){say('JSON 가져오기 실패: '+err.message)}ev.target.value=''};
+-async function search(){try{const d=await api('/api/search',{name:queryName,page});total=d.total;$('#candidates').innerHTML=d.items.map((p,n)=>'<button class="candidate" data-candidate="'+n+'">'+e(p.ITEM_NAME)+'<small>'+e(p.ENTP_NAME)+' · 품목 '+e(p.ITEM_SEQ)+' · '+e(p.SPCLTY_PBLC)+' · '+e(p.CANCEL_NAME)+'</small></button>').join('')||'<p>검색 결과가 없습니다. 제품명을 짧게 또는 정확한 이름으로 바꿔 검색하세요.</p>';$('#pageInfo').textContent='총 '+total+'건 / '+page+'페이지';$('#prev').hidden=page===1;$('#next').hidden=page*50>=total;document.querySelectorAll('[data-candidate]').forEach(b=>b.onclick=()=>select(d.items[Number(b.dataset.candidate)]))}catch(err){say(err.message)}}
+-$('#searchForm').onsubmit=ev=>{ev.preventDefault();queryName=$('#query').value.trim();page=1;search()};$('#prev').onclick=()=>{page--;search()};$('#next').onclick=()=>{page++;search()};
+-function plain(s){return String(s??'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim()}
+-async function select(product){try{const d=await api('/api/detail',{code:String(product.ITEM_SEQ)});chosen={...d,linked:[]};$('#selectedTitle').textContent=d.product.ITEM_NAME;$('#detailEmpty').hidden=true;$('#detailBody').hidden=false;$('#reviewed').checked=false;$('#extraPhotos').value='';$('#linkedPhotos').textContent='추가 사진 없음';const p=d.product;$('#official').innerHTML='<p><strong>'+e(p.ITEM_NAME)+'</strong> · '+e(p.ENTP_NAME)+' · 품목기준코드 '+e(p.ITEM_SEQ)+'</p>'+[['주성분 표기',p.MAIN_ITEM_INGR],['총량·기준 원문',p.TOTAL_CONTENT],['원료·분량 원문',p.MATERIAL_NAME],['제품 성상',p.CHART],['허가·취소 상태',p.CANCEL_NAME]].map(([k,v])=>'<p><b>'+e(k)+':</b> '+e(v||'응답 없음')+'</p>').join('')+d.warnings.map(w=>'<div class="notice amber">'+e(w)+'</div>').join('')+[['용법·용량 원문 (성인·소아 혼합 가능)',p.UD_DOC_DATA],['주의사항 원문 (병용 주의 포함 여부 직접 확인)',p.NB_DOC_DATA]].map(([k,v])=>'<details><summary>'+e(k)+'</summary><p>'+e(plain(v)||'응답 없음')+'</p></details>').join('');$('#raw').textContent=JSON.stringify({product:d.product,ingredients:d.ingredients_raw},null,2);$('#rows').innerHTML='';if(d.ingredients_raw.length)d.ingredients_raw.forEach(i=>addRow({name:i.MTRAL_NM,ingredient_code:i.MTRAL_CODE,amount:/^\d+(\.\d+)?$/.test(String(i.QNT))?i.QNT:'',unit:['mg','g','μg'].includes(i.INGD_UNIT_CD)?i.INGD_UNIT_CD:'',evidence:JSON.stringify(i)}));else addRow();$('#details').scrollIntoView({behavior:'smooth'})}catch(err){say(err.message)}}
+-function addRow(data={}){const tr=document.createElement('tr');tr.innerHTML='<td><input data-field="name" aria-label="성분명" value="'+e(data.name||'')+'"></td><td><input data-field="ingredient_code" aria-label="성분코드" value="'+e(data.ingredient_code||'')+'"></td><td><input data-field="amount" aria-label="함량" type="number" min="0" step="any" value="'+e(data.amount||'')+'"></td><td><select data-field="unit" aria-label="함량 단위"><option value="">선택</option>'+['mg','g','μg'].map(u=>'<option '+(u===data.unit?'selected':'')+'>'+u+'</option>').join('')+'</select></td><td><input data-field="basis_quantity" aria-label="함량 기준 수량" type="number" min="0" step="any" placeholder="예: 1"></td><td><select data-field="basis_unit" aria-label="함량 기준 단위"><option value="">선택</option>'+['정','캡슐','mL','포'].map(u=>'<option>'+u+'</option>').join('')+'</select></td><td><textarea data-field="evidence" aria-label="원문 근거">'+e(data.evidence||'')+'</textarea></td><td><button class="remove">삭제</button></td>';tr.querySelector('.remove').onclick=()=>{tr.remove();$('#reviewed').checked=false};tr.querySelectorAll('input,select,textarea').forEach(i=>i.oninput=()=>$('#reviewed').checked=false);$('#rows').appendChild(tr)}$('#addRow').onclick=()=>{addRow();$('#reviewed').checked=false};
+-$('#extraPhotos').onchange=async ev=>{try{if(!chosen)return;for(const f of ev.target.files){validatePhoto(f);const hash=await photoHash(f);if(chosen.linked.some(p=>p.hash===hash)){say('중복 사진은 제외했습니다.');continue}chosen.linked.push({name:f.name,hash})}$('#linkedPhotos').textContent=chosen.linked.map(p=>p.name+' (로컬 연결·자동 분석 안 됨)').join(' / ')}catch(err){say(err.message)}ev.target.value=''};
+-$('#addProduct').onclick=()=>{try{if(!chosen||!$('#reviewed').checked)throw Error('공식 원문 대조 확인란을 선택하세요.');const ingredients=[...$('#rows').children].map(tr=>Object.fromEntries([...tr.querySelectorAll('[data-field]')].map(i=>[i.dataset.field,i.value.trim()])));if(!ingredients.length||ingredients.some(i=>!i.name||!i.amount||!i.unit||!i.basis_quantity||!i.basis_unit||!i.evidence))throw Error('모든 성분의 함량·단위·기준 수량·근거를 입력하세요.');if(new Set(ingredients.map(i=>i.basis_unit)).size!==1)throw Error('제품 내 모든 성분의 기준 단위를 맞춰 주세요.');const p=chosen.product,code=String(p.ITEM_SEQ);if(basket.some(p=>p.code===code))throw Error('이미 추가한 제품입니다. 목록에서 수량을 변경하세요.');basket.push({name:p.ITEM_NAME,code,quantity:0,quantity_unit:ingredients[0].basis_unit,ingredients,confirmed:true,source:chosen.source,photos:chosen.linked,warning_text:plain(p.NB_DOC_DATA),directions_text:plain(p.UD_DOC_DATA)});renderBasket();say('제품을 추가했습니다. 가정 수량을 입력하세요.');$('#basket').scrollIntoView({behavior:'smooth'})}catch(err){say(err.message)}};
+-function renderBasket(){invalidate();$('#basketList').className='';$('#basketList').innerHTML=basket.map((p,n)=>'<div class="basketitem"><div><strong>'+e(p.name)+'</strong><small>'+e(p.code)+' · '+p.ingredients.length+'개 성분</small></div><label><input data-quantity="'+n+'" aria-label="'+e(p.name)+' 가정 수량" type="number" min="0" max="1000000" step="any" value="'+e(p.quantity)+'"> '+e(p.quantity_unit)+'</label><button data-remove="'+n+'">제외</button></div>').join('')||'<p>추가한 제품이 없습니다.</p>';document.querySelectorAll('[data-quantity]').forEach(i=>i.oninput=()=>{basket[Number(i.dataset.quantity)].quantity=i.value;invalidate()});document.querySelectorAll('[data-remove]').forEach(b=>b.onclick=()=>{basket.splice(Number(b.dataset.remove),1);renderBasket()})}
+-$('#mode').onchange=invalidate;$('#clear').onclick=()=>{basket=[];renderBasket()};$('#demo').onclick=async()=>{try{if(basket.length)throw Error('예제를 불러오려면 기존 계산 목록을 먼저 초기화하세요.');basket=await(await fetch('/sample.json')).json();renderBasket();say('실제 약이 아닌 가상 예제입니다. 수량을 입력해 보세요.')}catch(err){say(err.message)}};
+-$('#evaluate').onclick=async()=>{try{if(!$('#scenarioConsent').checked)throw Error('복용 가정 확인란을 선택하세요.');const report=await api('/api/evaluate',{products:basket,mode:$('#mode').value});report.manual_warning_review=basket.filter(p=>Number(p.quantity)>0).map(p=>({product:p.name,warning_text:p.warning_text||'공식 주의사항 원문 미확인',directions_text:p.directions_text||'용법용량 원문 미확인'}));lastReport=report;$('#download').disabled=false;$('#result').className='';$('#result').innerHTML='<div class="notice amber">'+e(report.notice)+'</div><p>계산 범위: '+($('#mode').value==='single'?'1회 가정':'1일 총량 가정')+' / <b>실제 복용·추가 복용 여부 미판정</b></p><div class="scroll"><table><tr><th>성분</th><th>가정 합산량</th><th>중복</th><th>기준 비교</th></tr>'+report.ingredients.map(i=>'<tr><td>'+e(i.ingredient)+'<small class="muted"> '+e(i.matching)+'</small></td><td>'+e(i.total_mg)+'mg</td><td>'+(i.duplicate?'동일 코드/표기 확인':'확인된 중복 없음')+'</td><td class="'+(i.criterion_status==='exceeded'?'danger':'')+'">'+e(i.criterion_status==='exceeded'?'등록 기준 초과':i.criterion_status==='not_exceeded'?'등록 기준 미초과':'기준 미등록·미판정')+'<br>'+e(i.criterion_note)+(i.limit_mg?'<br>기준 '+e(i.limit_mg)+'mg':'')+'</td></tr>').join('')+'</table></div><details><summary>제품별 기여량·원문 근거</summary><pre>'+e(JSON.stringify(report.ingredients,null,2))+'</pre></details><details open><summary>병용 관련 문구는 용량 합산과 별도로 확인하세요</summary>'+report.manual_warning_review.map(p=>'<h4>'+e(p.product)+'</h4><p>'+e(p.warning_text)+'</p>').join('')+'</details><p><b>자동 평가하지 않은 항목:</b> '+e(report.unassessed.join(' / '))+'</p>';say('성분 합산을 완료했습니다. 적용되지 않은 기준과 주의사항을 확인하세요.')}catch(err){say(err.message)}};
+-$('#download').onclick=()=>{if(!lastReport)return;const url=URL.createObjectURL(new Blob([JSON.stringify(lastReport,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='learningflow-result.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
++const $ = s => document.querySelector(s);
++const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
++let token = '', busy = false, photoId = null, candidates = [], selected = null;
++let basket = [], lastReport = null, page = 1, searchName = '', demoMode = false;
++const say = message => { $('#status').textContent = message; if ($('#mismatchDialog').open) $('#mismatchStatus').textContent = message; };
++
++async function api(path, data) {
++  if (busy) throw Error('진행 중인 요청을 기다려 주세요.');
++  busy = true;
++  say('처리 중입니다. 후보가 많으면 상세 조회에 시간이 걸릴 수 있습니다.');
++  document.querySelectorAll('button').forEach(b => { b.dataset.disabledBefore = String(b.disabled); b.disabled = true; });
++  try {
++    const response = await fetch(path, {method:'POST', cache:'no-store', headers:{'Content-Type':'application/json','X-App-Token':token}, body:JSON.stringify(data)});
++    const result = await response.json();
++    if (!response.ok) throw Error(result.error || '요청을 처리하지 못했습니다.');
++    return result;
++  } finally {
++    busy = false;
++    document.querySelectorAll('button').forEach(b => { b.disabled = b.dataset.disabledBefore === 'true'; });
++  }
++}
++
++async function start() {
++  try {
++    const result = await (await fetch('/api/status', {cache:'no-store'})).json();
++    token = result.token;
++    const checkedAt = result.checked_at ? new Date(result.checked_at).toLocaleTimeString('ko-KR') : '';
++    $('#connection').textContent = `항상 최신 확정 설정 사용 / 연결 확인 ${checkedAt} / 식약처 키 ${result.mfds_ready ? '입력됨' : '미입력'} / Upstage 키 ${result.studio_ready ? '입력됨' : '미입력'}${result.legacy_config_ignored ? ' / 예전 설정 번호는 무시됨' : ''}`;
++  } catch { say('Python 서버 연결을 확인하세요.'); }
++}
++
++function invalidate() {
++  lastReport = null;
++  $('#download').disabled = true;
++  $('#scenarioConsent').checked = false;
++  $('#result').textContent = '입력이 변경되었습니다. 가정을 확인하고 다시 계산하세요.';
++}
++
++function strengthLabel(value) {
++  if (!value) return '정보 없음';
++  return value.mg === null ? (value.raw || '함량 미확인') + ' (미확인)' : `${value.raw} → ${value.mg}mg`;
++}
++
++function comparisonTable(comparison, differencesOnly = false) {
++  const rows = (comparison.rows || []).filter(r => !differencesOnly || r.status !== '일치');
++  if (!rows.length) return '<p>대조할 성분 정보가 없습니다. 확인 필요.</p>';
++  return '<div class="scroll"><table><thead><tr><th>성분</th><th>사진 추출</th><th>공식 함량</th><th>대조 상태</th></tr></thead><tbody>' + rows.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(strengthLabel(r.photo?.strength))}</td><td>${esc(strengthLabel(r.official?.strength))}</td><td><span class="match-state ${r.status === '일치' ? 'match-ok' : r.status === '함량 불일치' ? 'match-diff' : 'match-review'}">${esc(r.status)}</span></td></tr>`).join('') + '</tbody></table></div>';
++}
++
++function renderPhotoSummary(extracted, studio) {
++  const x = extracted || {};
++  const ingredients = Array.isArray(x.effective_ingredients) ? x.effective_ingredients : [];
++  const cautions = Array.isArray(x.do_not_take_with) ? x.do_not_take_with.map(v => typeof v === 'string' ? v : v.item_name || '').filter(Boolean).join('\n') : '';
++  const values = [
++    ['제품명', x.product_name_raw], ['제조사', x.manufacturer],
++    ['유효성분 목록', ingredients.map(i => `${i.ingredient_name || '성분명 미확인'} ${i.strength_per_unit || '(함량 미확인)'}`).join('\n')],
++    ['성인 용법·용량', x.dosage_and_administration], ['하루 최대량 원문', x.max_daily_dose],
++    ['중복·병용 관련 주의사항', cautions]
++  ];
++  $('#photoSummary').innerHTML = '<table><thead><tr><th>항목명</th><th>사진 추출 결과</th></tr></thead><tbody>' + values.map(([name, value]) => `<tr><td>${esc(name)}</td><td>${esc(value || '사진에서 확인되지 않음').replace(/\n/g, '<br>')}</td></tr>`).join('') + '</tbody></table>';
++  const policy = studio ? '최신 설정 요청' : '가져온 Extract JSON';
++  $('#analysisVersion').textContent = `${policy} / ${studio?.config_id ? '응답 설정 ' + studio.config_id : '응답에 설정 번호 없음'}${studio?.selected_model ? ' / 사용 노드 ' + studio.selected_model : ''}`;
++}
++
++function renderCandidates(result) {
++  candidates = result.candidates || [];
++  photoId = result.photo_id;
++  selected = null;
++  $('#detailBody').hidden = true;
++  $('#selectedTitle').textContent = '후보 선택 대기';
++  $('#reviewed').checked = false;
++  $('#studioResult').textContent = JSON.stringify(result.studio || {extracted:result.photo_extracted}, null, 2);
++  renderPhotoSummary(result.photo_extracted, result.studio);
++  const name = result.photo_extracted?.product_name_raw;
++  if (typeof name === 'string' && !searchName) $('#query').value = name;
++  $('#searchReason').textContent = [result.reason, ...(result.warnings || []), ...(result.studio?.warnings || [])].filter(Boolean).join(' / ');
++  $('#pageInfo').textContent = `검색 ${result.total || 0}건 / ${result.page || 1}페이지 / 이번 대조 ${candidates.length}개`;
++  $('#prev').hidden = page <= 1;
++  $('#next').hidden = page * 10 >= (result.total || 0);
++  $('#candidates').className = '';
++  $('#candidates').innerHTML = candidates.map((c, n) => `<article class="candidate-card"><button class="candidate" data-select="${n}"><strong>${esc(c.product.ITEM_NAME)}</strong><small>${esc(c.product.ENTP_NAME)} · ${esc(c.product.ITEM_SEQ)} · 제조사 ${c.manufacturer_match ? '일치' : '미일치 또는 미확인'} · 성분 대조 ${esc(c.comparison.status)}</small>이 제품 선택</button>${comparisonTable(c.comparison)}${c.comparison.warnings.map(w => `<p class="danger">${esc(w)}</p>`).join('')}</article>`).join('') || '<p>제품을 찾지 못함. 추출값을 확인하고 직접 검색하세요.</p>';
++  document.querySelectorAll('[data-select]').forEach(b => { b.onclick = () => selectCandidate(Number(b.dataset.select)); });
++  say(candidates.length ? '정렬된 후보를 확인하고 제품을 선택하세요. 자동 선택하지 않았습니다.' : '공식 제품 미확인. 직접 검색할 수 있습니다.');
++}
++
++$('#analyze').onclick = async () => {
++  try {
++    const file = $('#image').files[0];
++    if (!file || !['image/jpeg','image/png','image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024) throw Error('사진 한 장(10MB 이하)을 선택하세요.');
++    if (!$('#consent').checked) throw Error('사진 전송 동의란을 확인하세요.');
++    const base64 = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(',')[1]); reader.onerror = reject; reader.readAsDataURL(file); });
++    searchName = ''; page = 1;
++    selected = null; candidates = []; photoId = null;
++    $('#candidates').textContent = '새 사진을 분석하고 있습니다.';
++    $('#detailBody').hidden = true;
++    $('#photoSummary').textContent = '새 분석 결과 대기 중입니다.';
++    $('#studioResult').textContent = '새 분석 결과 대기 중입니다.';
++    renderCandidates(await api('/api/analyze-and-match', {base64, mime:file.type, consent:true}));
++  } catch (error) { say(error.message); }
++};
++
++async function manualSearch() {
++  try { renderCandidates(await api('/api/match-search', {photo_id:photoId, name:searchName, page})); }
++  catch (error) { say(error.message); }
++}
++$('#searchForm').onsubmit = event => { event.preventDefault(); page = 1; searchName = $('#query').value.trim(); manualSearch(); };
++$('#prev').onclick = () => { page--; searchName = searchName || $('#query').value.trim(); manualSearch(); };
++$('#next').onclick = () => { page++; searchName = searchName || $('#query').value.trim(); manualSearch(); };
++$('#jsonImport').onchange = async event => {
++  try {
++    const file = event.target.files[0];
++    if (!file) return;
++    if (file.size > 1024 * 1024) throw Error('JSON은 1MB 이하로 입력하세요.');
++    const imported = JSON.parse(await file.text());
++    searchName = ''; page = 1;
++    renderCandidates(await api('/api/import-and-match', {extracted:imported.extracted || imported}));
++  } catch (error) { say(error.message); }
++  event.target.value = '';
++};
++
++function selectCandidate(index) {
++  selected = candidates[index];
++  $('#reviewed').checked = false;
++  $('#detailBody').hidden = false;
++  const p = selected.product;
++  $('#selectedTitle').textContent = `${p.ITEM_NAME || '제품명 미확인'} / ${p.ENTP_NAME || '제조사 미확인'}`;
++  $('#official').innerHTML = `<p>품목기준코드 ${esc(p.ITEM_SEQ)} / 제형·성상 ${esc(p.CHART || '미확인')}</p><details><summary>공식 용법·용량 원문</summary><pre>${esc(p.UD_DOC_DATA || '공식 원문 응답 없음')}</pre></details><details><summary>공식 주의사항 원문</summary><pre>${esc(p.NB_DOC_DATA || '공식 원문 응답 없음')}</pre></details>`;
++  $('#comparison').innerHTML = comparisonTable(selected.comparison);
++  $('#calculationState').innerHTML = selected.comparison.warnings.map(w => `<p class="danger">${esc(w)}</p>`).join('');
++  $('#raw').textContent = JSON.stringify(selected, null, 2);
++  $('#addProduct').disabled = !selected.comparison.calculation_ready;
++  $('#details').scrollIntoView({behavior:'smooth'});
++}
++
++async function confirmSelected(mismatchAck) {
++  if (!selected) throw Error('제품을 선택하세요.');
++  if (demoMode && basket.length) throw Error('가상 예제 목록을 초기화한 후 실제 제품을 추가하세요.');
++  if (basket.some(p => p.code === String(selected.product.ITEM_SEQ))) throw Error('이미 추가한 제품입니다. 수량을 변경하세요.');
++  const result = await api('/api/confirm-match', {candidate_id:selected.candidate_id, confirmed:$('#reviewed').checked, mismatch_ack:mismatchAck});
++  basket.push({...result.product, approval_id:result.approval_id});
++  demoMode = false;
++  renderBasket();
++  if ($('#mismatchDialog').open) $('#mismatchDialog').close();
++  say('공식 성분으로 제품을 추가했습니다. 가정 수량을 입력하세요.');
++  $('#basket').scrollIntoView({behavior:'smooth'});
++}
++$('#addProduct').onclick = async () => {
++  try {
++    if (!selected || !$('#reviewed').checked) throw Error('선택 제품의 공식 원문 확인란을 선택하세요.');
++    if (selected.comparison.status !== '일치') {
++      $('#mismatchRows').innerHTML = comparisonTable(selected.comparison, true);
++      $('#mismatchReviewed').checked = false;
++      $('#mismatchStatus').textContent = '';
++      $('#mismatchDialog').showModal();
++      return;
++    }
++    await confirmSelected(false);
++  } catch (error) { say(error.message); }
++};
++$('#mismatchAccept').onclick = async () => {
++  try { if (!$('#mismatchReviewed').checked) throw Error('불일치 항목 추가 확인란을 선택하세요.'); await confirmSelected(true); }
++  catch (error) { say(error.message); }
++};
++$('#mismatchCancel').onclick = () => $('#mismatchDialog').close();
++
++function renderBasket() {
++  invalidate();
++  $('#basketList').className = '';
++  $('#basketList').innerHTML = basket.map((p, n) => `<div class="basketitem"><div><strong>${esc(p.name)}</strong><small>${esc(p.code)} / 공식 성분 ${p.ingredients.length}개${demoMode ? ' / 가상 예제' : ''}</small></div><label><input data-quantity="${n}" aria-label="${esc(p.name)} 가정 수량" type="number" min="0" max="1000000" step="any" value="${esc(p.quantity)}"> ${esc(p.quantity_unit)}</label><button data-remove="${n}">제외</button></div>`).join('') || '<p>추가한 제품 없음</p>';
++  document.querySelectorAll('[data-quantity]').forEach(i => { i.oninput = () => { basket[Number(i.dataset.quantity)].quantity = i.value; invalidate(); }; });
++  document.querySelectorAll('[data-remove]').forEach(b => { b.onclick = () => { basket.splice(Number(b.dataset.remove),1); if (!basket.length) demoMode = false; renderBasket(); }; });
++}
++$('#mode').onchange = invalidate;
++$('#clear').onclick = () => { basket = []; demoMode = false; renderBasket(); };
++$('#demo').onclick = async () => { try { if (basket.length) throw Error('먼저 목록을 초기화하세요.'); basket = await (await fetch('/sample.json')).json(); demoMode = true; renderBasket(); } catch (error) { say(error.message); } };
++$('#evaluate').onclick = async () => {
++  try {
++    if (!$('#scenarioConsent').checked) throw Error('가정 확인란을 선택하세요.');
++    const data = demoMode ? {quantities:basket.map(p => p.quantity), mode:$('#mode').value} : {products:basket.map(p => ({approval_id:p.approval_id, quantity:p.quantity})), mode:$('#mode').value};
++    const report = await api(demoMode ? '/api/demo-evaluate' : '/api/evaluate', data);
++    lastReport = report;
++    $('#download').disabled = false;
++    $('#result').className = '';
++    $('#result').innerHTML = `<div class="notice amber">${esc(report.notice)}</div><div class="scroll"><table><tr><th>성분</th><th>합산량</th><th>묶음 방식</th><th>중복</th><th>기준 비교</th></tr>${report.ingredients.map(i => `<tr><td>${esc(i.ingredient)}</td><td>${esc(i.total_mg)}mg</td><td>${esc(i.matching)}</td><td>${i.duplicate ? '중복 확인' : '확인한 중복 없음'}</td><td>${i.criterion_status === 'exceeded' ? '등록 기준 초과' : i.criterion_status === 'not_exceeded' ? '등록 기준 미초과' : '확인 필요'}<br>${esc(i.criterion_note)}</td></tr>`).join('')}</table></div><details><summary>계산 근거와 미확인 항목</summary><pre>${esc(JSON.stringify(report,null,2))}</pre></details>`;
++    say('공식 데이터 기준 합산을 완료했습니다. 미확인 항목을 함께 확인하세요.');
++  } catch (error) { say(error.message); }
++};
++$('#download').onclick = () => {
++  if (!lastReport) return;
++  const url = URL.createObjectURL(new Blob([JSON.stringify(lastReport,null,2)],{type:'application/json'}));
++  const a = document.createElement('a'); a.href = url; a.download = 'learningflow-revised-result.json'; a.click();
++  setTimeout(() => URL.revokeObjectURL(url),1000);
++};
++// 뒤로 가기 캐시로 복원된 화면도 연결을 갱신하되 사진 재전송은 하지 않습니다.
++if (typeof window !== 'undefined') window.addEventListener('pageshow', event => {
++  if (event.persisted) start();
++});
++start();
+--- original/static/index.html
++++ revised/static/index.html
+@@ -1,6 +1,10 @@
+-<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>러닝플로우 | 약품 성분 확인</title><link rel="stylesheet" href="/style.css"></head><body><header><a href="/" class="logo">✳ 러닝플로우 <small>MEDICATION CHECK</small></a><span>내 컴퓨터에서 실행 중</span></header><main><div class="eyebrow">KUS × UPSTAGE HACKATHON</div><h1>약의 이름에서,<br>성분과 근거까지.</h1><p class="lead">설명서와 식약처 정보를 확인하고, 함께 복용하려는 제품의 성분량을 비교하세요.</p><div id="connection" class="notice" role="status">연결 설정 확인 중…</div><div class="notice amber">성분 중복과 가정 수량에 따른 용량만 확인합니다. ‘함께 먹어도 안전하다’거나 ‘추가 복용 가능’을 판단하지 않습니다.</div><nav><a href="#search">01 제품 찾기</a><a href="#details">02 원문 확인</a><a href="#basket">03 합산하기</a></nav>
+-<div class="grid"><section class="card" id="photo"><h2><em>선택</em> 사진에서 제품명 읽기</h2><p>사진 한 장을 독립적으로 분석합니다. 같은 제품의 사진은 아래에서 동일 제품에 추가 보관하세요.</p><div class="notice">최신 설정 자동 적용 · Studio에서 수정 후 한 번 실행해 버전을 확정하세요. 아래 분석 버튼을 누를 때마다 최신 버전으로 새 작업을 요청합니다. 기존 결과는 재분석해야 갱신됩니다.</div><input id="image" type="file" accept="image/jpeg,image/png,image/webp"><label class="check"><input id="consent" type="checkbox"> 이 사진이 Upstage로 전송되어 분석되며 API 사용량이 발생함에 동의합니다. 개인정보는 가리고 업로드하세요.</label><button id="analyze">최신 에이전트로 사진 분석 / 재분석</button><details><summary>분석 결과 / 기존 Studio JSON 가져오기</summary><pre id="studioResult">아직 분석 결과가 없습니다.</pre><input id="jsonImport" type="file" accept=".json,application/json"><p>최종 Instruct가 표를 반환해도 원문을 표시합니다. 구조화 JSON에 제품명이 있으면 검색창에 채웁니다. 성분을 자동 확정하지 않습니다.</p></details></section>
+-<section class="card" id="search"><h2><em>01</em> 식약처 제품 검색</h2><p>사진에서 읽은 이름이나 직접 입력한 제품명으로 검색합니다.</p><form id="searchForm"><label for="query">제품명</label><div class="inline"><input id="query" placeholder="예: 타이레놀" maxlength="150" required><button class="primary">검색 →</button></div></form><p class="muted">같은 브랜드라도 함량·제형이 다릅니다. 목록에서 정확한 제품을 선택하세요.</p><div id="candidates"></div><div class="inline"><button id="prev" hidden>이전</button><button id="next" hidden>다음</button><span id="pageInfo"></span></div></section></div>
+-<section class="card" id="details"><div class="sectionhead"><h2><em>02</em> 공식 정보와 계산값 확인</h2><span id="selectedTitle">제품 선택 대기</span></div><div id="detailEmpty" class="empty">제품을 검색해 선택하면 주성분·함량 원문과 용법용량을 표시합니다.</div><div id="detailBody" hidden><div id="official"></div><details><summary>식약처 원료·주성분 원본 응답</summary><pre id="raw"></pre></details><div class="notice amber">API의 단위가 코드이거나 함량 기준이 모호하면 자동 변환하지 않습니다. 원문을 확인하고 아래 값을 입력하세요. 첨가제를 유효성분으로 넣지 마세요.</div><label>이 제품에 속하는 추가 설명서 사진 <input id="extraPhotos" type="file" accept="image/jpeg,image/png,image/webp" multiple></label><p id="linkedPhotos" class="muted"></p><div class="scroll"><table><thead><tr><th>성분명</th><th>공식 성분코드<br>(없으면 비움)</th><th>함량</th><th>단위</th><th>기준 수량</th><th>기준 단위</th><th>원문 근거</th><th></th></tr></thead><tbody id="rows"></tbody></table></div><button id="addRow">+ 성분 행 추가</button><label class="check"><input id="reviewed" type="checkbox"> 제품명·제형·모든 유효성분·함량·기준 단위를 공식 원문과 대조했습니다.</label><button class="primary" id="addProduct">계산 목록에 추가 →</button></div></section>
+-<section class="card" id="basket"><div class="sectionhead"><h2><em>03</em> 복용 가정과 성분 합산</h2><button id="demo">가상 예제로 체험</button></div><p>자동으로 권장량을 정하지 않습니다. 비교할 수량을 직접 입력하세요. 1일 가정은 입력한 하루 총수량의 비교이며 복용 간격을 평가하지 않습니다.</p><label>계산 범위 <select id="mode"><option value="single">1회 복용 가정</option><option value="day">1일 총복용 가정</option></select></label><div id="basketList" class="empty">제품을 추가해 주세요.</div><label class="check"><input id="scenarioConsent" type="checkbox"> 일반 성인의 비교용 시나리오입니다. 실제 복용 이력과 개인별 안전성 평가가 아님을 확인합니다.</label><button class="primary" id="evaluate">성분별 합산량 확인 →</button><button id="clear">목록 초기화</button></section>
+-<section class="card"><div class="sectionhead"><h2><em>04</em> 결과와 확인이 필요한 정보</h2><button id="download" disabled>결과 JSON ↓</button></div><div id="result" class="empty">계산 결과가 여기에 표시됩니다.</div></section><p id="status" role="status" aria-live="polite"></p><footer><a href="https://www.data.go.kr/data/15095677/openapi.do" target="_blank" rel="noopener">식약처 공식 데이터 출처 ↗</a><p>사진과 복용 가정은 로컬 앱 메모리에서 처리합니다. Studio 분석을 누른 사진만 Upstage로 전송됩니다.<br>로컬 영구 저장 기능은 없습니다. 서버 재시작 시 키 설정을 다시 읽을 수 있으며, 브라우저 새로고침 시 작업 내용은 사라집니다.</p></footer></main><script src="/app.js"></script></body></html>
++<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>러닝플로우 수정본 | 성분 대조</title><link rel="stylesheet" href="/style.css"></head><body>
++<header><a class="logo" href="/">러닝플로우 <small>사진과 공식 성분 대조</small></a><span>별도 수정본</span></header>
++<main><div class="eyebrow">KUS × UPSTAGE</div><h1>사진 추출과 공식 정보를<br>나란히 확인하세요.</h1><div id="connection" class="notice" role="status">최신 연결 상태 확인 중</div><div class="notice">항상 Studio의 최신 확정 설정으로 새 분석을 요청합니다. Studio 수정 후 실행해 설정을 확정하고 이 페이지를 새로고침하세요. 새로고침은 연결 상태만 갱신하며, 사진은 분석 버튼을 누를 때만 전송합니다.</div><div class="notice amber">성분과 가정 수량만 비교합니다. 모든 불명확한 항목은 확인 필요로 남깁니다. 실제 복용 여부를 판단하지 않습니다.</div>
++<div class="grid"><section class="card"><h2>01 사진 분석과 공식 후보 조회</h2><input id="image" type="file" accept="image/jpeg,image/png,image/webp"><label class="check"><input id="consent" type="checkbox"> 사진의 Upstage 전송과 API 사용량 발생을 확인했습니다. 분석 종료 후 업로드 파일 삭제를 시도합니다.</label><button class="primary" id="analyze">사진 분석 후 후보 대조 →</button><p>한국어·영문 Extract 출력을 지원합니다. 에이전트 변경 후 사진을 다시 분석해야 결과가 갱신됩니다.</p><p id="analysisVersion" class="muted">분석 버전 정보 대기</p><div id="photoSummary" aria-live="polite">사진 추출 결과가 여기에 표시됩니다.</div><details><summary>Studio 추출 원본과 경고</summary><pre id="studioResult">분석 전</pre></details><label>Extract JSON 가져오기 <input id="jsonImport" type="file" accept=".json,application/json"></label></section>
++<section class="card"><h2>02 직접 검색 또는 재검색</h2><form id="searchForm"><label for="query">제품명</label><div class="inline"><input id="query" required maxlength="150" placeholder="사진에서 읽은 제품명"><button>검색</button></div></form><p>사진에서 제품을 찾지 못하면 직접 검색하세요. 기존 사진 추출값을 유지해 새 후보와 비교합니다.</p><div class="inline"><button id="prev" hidden>이전 페이지</button><button id="next" hidden>다음 페이지</button><span id="pageInfo"></span></div><div id="searchReason" role="status"></div></section></div>
++<section class="card"><h2>03 정렬된 후보와 성분별 대조</h2><div id="candidates" class="empty">사진을 분석하거나 제품을 검색하세요.</div></section>
++<section class="card" id="details"><h2>04 선택한 제품 확인</h2><div id="selectedTitle" class="empty">후보 선택 대기</div><div id="detailBody" hidden><div id="official"></div><div id="comparison"></div><div id="calculationState"></div><details><summary>공식 원본과 사진 근거</summary><pre id="raw"></pre></details><label class="check"><input id="reviewed" type="checkbox"> 제품명·제조사·제형과 공식 유효성분·함량·함량 기준을 확인했습니다.</label><button id="addProduct" class="primary">선택 제품 확인 후 계산 목록에 추가</button></div></section>
++<section class="card" id="basket"><div class="sectionhead"><h2>05 가정 수량에 따른 계산</h2><button id="demo">가상 예제 체험</button></div><p>계산값은 공식 응답에서만 가져옵니다. 사진 추출값은 근거로만 남깁니다. 단위나 함량 기준 미확인 제품은 추가할 수 없습니다.</p><label>계산 범위 <select id="mode"><option value="single">1회 복용 가정</option><option value="day">1일 총량 가정</option></select></label><div id="basketList" class="empty">추가한 제품 없음</div><label class="check"><input id="scenarioConsent" type="checkbox"> 성인 가정 시나리오이며 실제 복용 이력·간격·개인별 조건은 평가하지 않음을 확인했습니다.</label><button class="primary" id="evaluate">성분 합산</button> <button id="clear">목록 초기화</button></section>
++<section class="card"><div class="sectionhead"><h2>06 결과와 미확인 정보</h2><button id="download" disabled>결과 JSON ↓</button></div><div id="result" class="empty">계산 전</div></section><p id="status" role="status" aria-live="polite"></p><footer>인증키는 이 수정본의 .env에서만 읽습니다. 새로고침 시 화면 상태가 지워지며 확인 기록은 서버 메모리에 최대 30분 보관됩니다.</footer></main>
++<dialog id="mismatchDialog"><h2>불일치 항목 추가 확인</h2><p>아래 항목을 다시 읽고 선택한 공식 제품이 맞는지 확인하세요. 사진 값은 계산에 사용하지 않습니다.</p><div id="mismatchRows"></div><label class="check"><input id="mismatchReviewed" type="checkbox"> 불일치·누락 항목을 다시 확인했고, 선택한 공식 제품으로 계산하는 것을 확인합니다.</label><p id="mismatchStatus" role="alert"></p><button id="mismatchAccept" class="primary">추가 확인 후 목록에 넣기</button> <button id="mismatchCancel">취소</button></dialog><script src="/app.js"></script></body></html>
+--- original/static/style.css
++++ revised/static/style.css
+@@ -1 +1,2 @@
+ *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font:15px/1.7 'Segoe UI','Malgun Gothic',sans-serif;background:#f5f8f6;color:#203a31}header{background:#fff;border-bottom:1px solid #dfe9e2;padding:23px max(5vw,20px);display:flex;justify-content:space-between;align-items:center}header>span{font-size:12px;color:#88978d}.logo{font-size:24px;text-decoration:none;font-weight:800;color:#17694e}.logo small{font-size:9px;letter-spacing:2px;margin-left:12px;color:#7f9588}main{max-width:1250px;margin:auto;padding:48px 30px}.eyebrow{font-size:11px;letter-spacing:2px;color:#4b876c;font-weight:700}h1{font-size:43px;letter-spacing:-1.5px;line-height:1.3;margin:20px 0}.lead{color:#74887b;margin-bottom:28px}.notice{border:1px solid #dce8df;border-radius:9px;background:#eaf4ed;padding:13px 17px;font-size:13px;margin:12px 0}.amber{background:#fff8ea;border-color:#f0e3c5;color:#876832}nav{display:flex;gap:40px;padding:20px 0 28px}a{color:#22734f}nav a{font-size:13px;text-decoration:none}section{scroll-margin-top:20px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.card{background:white;border:1px solid #dfe8e1;border-radius:15px;padding:26px;margin-bottom:24px;min-width:0}h2{font-size:19px;margin:0 0 20px;letter-spacing:-.5px}em{font-style:normal;font-size:12px;color:#62967a;margin-right:12px}.card p{font-size:13px;color:#74877a}button{font:inherit;cursor:pointer;border:1px solid #d5e1d8;color:#395848;background:white;border-radius:8px;padding:10px 16px;white-space:nowrap}button:hover{background:#edf5ef;border-color:#6f9b80}button.primary{background:#17694e;color:#fff;border-color:#17694e}button:disabled{opacity:.45;cursor:wait}.inline{display:flex;gap:10px;align-items:center;margin:8px 0}.inline input{flex:1;min-width:0}input,select,textarea{font:inherit;border:1px solid #cfded3;border-radius:6px;padding:9px;color:#244834;background:#fff;max-width:100%}input[type=file]{font-size:12px;width:100%}input[type=checkbox]{accent-color:#17694e}.check{display:flex;gap:10px;align-items:flex-start;margin:20px 0;font-size:12px}.check input{margin-top:5px;flex:none}.sectionhead{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:15px}.sectionhead h2{margin:0}.sectionhead>span{font-size:12px;color:#7b8d80}.empty{text-align:center;color:#8b9b90;padding:35px 10px;font-size:13px}.muted{font-size:12px;color:#839387}details{margin:20px 0;font-size:13px}summary{cursor:pointer;color:#376d4c}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f7f4;border-radius:8px;padding:15px;font:12px/1.7 Consolas,'Malgun Gothic',monospace;max-height:380px;overflow:auto}.candidate{display:block;text-align:left;width:100%;margin:9px 0;white-space:normal}.candidate small{display:block;color:#849488;font-size:11px}.scroll{overflow:auto;margin:22px 0}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:12px 8px;text-align:left;border-bottom:1px solid #e4ece6;vertical-align:top}th{color:#7b9282;background:#f5f9f6;font-weight:500}td input{width:120px;font-size:12px}td input[type=number]{width:85px}td textarea{width:180px;height:65px;font-size:12px}td select{width:90px;font-size:12px}.basketitem{border-bottom:1px solid #e3ece5;padding:15px 0;display:flex;gap:14px;align-items:center;justify-content:space-between}.basketitem strong{font-size:14px}.basketitem small{display:block;color:#859489;font-size:11px}.basketitem input{width:100px}.badge{font-size:11px;display:inline-block;border-radius:20px;background:#edf4ee;padding:4px 10px;color:#427052}.danger{color:#a14636}.banners{padding:13px;border:1px solid #ead9ba;background:#fff9ed;border-radius:8px}#status{position:sticky;bottom:14px;border-radius:9px;background:#213e2f;color:#fff;padding:14px 18px;font-size:13px;box-shadow:0 5px 25px #193f2d20}#status:empty{display:none}footer{font-size:11px;color:#8a998e;text-align:center;margin:35px 0}footer a{font-size:12px}@media(max-width:850px){.grid{grid-template-columns:1fr}main{padding:30px 17px}h1{font-size:34px}.card{padding:20px}.logo small{display:none}.basketitem{flex-wrap:wrap}.sectionhead{flex-wrap:wrap}nav{gap:20px}header>span{font-size:10px}}
++dialog{border:1px solid #d5e1d8;border-radius:14px;width:min(900px,94vw);max-height:85vh;padding:28px;color:#203a31}dialog::backdrop{background:#15281d88}.candidate-card{border:1px solid #dfe8e1;padding:16px;margin:18px 0;border-radius:10px}.match-state{display:inline-block;border-radius:6px;padding:4px 9px;font-size:12px}.match-ok{background:#e3f2e9;color:#226241}.match-diff{background:#fae4e1;color:#9b3429}.match-review{background:#fff0d5;color:#856222}
+--- original/studio_client.py
++++ revised/studio_client.py
+@@ -1,38 +1,80 @@
+-"""외부 SDK 없이 Upstage Files/Responses API를 호출합니다. 사진은 요청 시에만 전송합니다."""
++"""Studio Extract 우선 선택, 설정 버전 정책, 업로드 파일 정리."""
+ import json
++import logging
++import re
+ import time
+ import uuid
++from urllib.parse import quote
+ from urllib.request import Request, urlopen
+ from urllib.error import HTTPError, URLError
+ 
+ from config import settings
+ from mfds_client import ServiceError
++from extraction_adapter import normalize_extraction
+ 
+ BASE = 'https://api.upstage.ai/v2'
++LOG = logging.getLogger(__name__)
+ 
+ 
+-def build_job_payload(agent, file_id):
+-    """config_id를 생략하면 최신 확정 버전 사용(Upstage Create job 공식 명세).
+-
+-    설정 번호를 캐시하거나 env의 과거 번호를 참조하지 않습니다.
+-    https://console.upstage.ai/api/agents/jobs/create-job
+-    """
+-    return {'model': agent, 'include': ['last'], 'input': [
++def build_job_payload(agent, file_id, config_id=None):
++    """항상 최신 설정. config_id 인자는 과거 호출 호환용이며 의도적으로 무시합니다."""
++    payload = {'model': agent, 'include': ['all'], 'input': [
+         {'role': 'user', 'content': [{'type': 'input_file', 'file_id': file_id}]}]}
++    return payload
+ 
+ 
+-def _request(path, key, payload=None, content_type='application/json'):
+-    headers = {'Authorization': 'Bearer ' + key, 'Content-Type': content_type}
+-    request = Request(BASE + path, data=payload, headers=headers)
++def _request(path, key, payload=None, content_type='application/json', method=None):
++    request = Request(BASE + path, data=payload,
++                      headers={'Authorization': 'Bearer ' + key, 'Content-Type': content_type}, method=method)
+     try:
+         with urlopen(request, timeout=45) as response:
+-            return json.load(response)
++            raw = response.read(16 * 1024 * 1024 + 1)
++            if len(raw) > 16 * 1024 * 1024:
++                raise ServiceError('Studio 결과 크기를 초과했습니다. 확인 필요.')
++            return json.loads(raw) if raw else {}
+     except HTTPError as error:
+-        raise ServiceError(f'Upstage HTTP {error.code}: 키·에이전트 접근 권한·사용 한도를 확인하세요.') from None
++        raise ServiceError(f'Upstage HTTP {error.code}: 키·접근 권한·사용 한도를 확인하세요.') from None
+     except (URLError, TimeoutError):
+-        raise ServiceError('Upstage에 연결하지 못했습니다. 나중에 다시 시도하세요.') from None
++        raise ServiceError('Upstage에 연결하지 못했습니다. 확인 필요.') from None
++    except (ValueError, TypeError, UnicodeError):
++        raise ServiceError('Upstage 응답 형식을 확인할 수 없습니다.') from None
++
++
++def _step_text(step):
++    if not isinstance(step, dict):
++        return ''
++    parts = step.get('content')
++    if not isinstance(parts, list):
++        return ''
++    return '\n'.join(p['text'] for p in parts if isinstance(p, dict)
++                     and p.get('type') == 'output_text' and isinstance(p.get('text'), str))
++
++
++def _parse_json(text):
++    text = text.strip()
++    fenced = re.fullmatch(r'```(?:json)?\s*([\s\S]*?)\s*```', text, re.I)
++    if fenced:
++        text = fenced.group(1)
++    try:
++        parsed = json.loads(text)
++        return parsed if isinstance(parsed, dict) else None
+     except (ValueError, TypeError):
+-        raise ServiceError('Upstage 응답을 읽지 못했습니다.') from None
++        return None
++
++
++def select_output(job):
++    outputs = job.get('output')
++    outputs = outputs if isinstance(outputs, list) else []
++    extracts = [s for s in outputs if isinstance(s, dict) and 'extract' in str(s.get('model', '')).lower()]
++    for step in reversed(extracts):
++        text = _step_text(step)
++        parsed = _parse_json(text)
++        if parsed is not None:
++            return text, parsed, str(step.get('model')), []
++    warnings = ['Extract 결과를 JSON으로 읽지 못해 마지막 출력으로 대체했습니다. 확인 필요.'] if extracts else []
++    step = outputs[-1] if outputs else {}
++    text = _step_text(step) or (job.get('output_text') if isinstance(job.get('output_text'), str) else '')
++    return text, _parse_json(text), str(step.get('model', 'last')) if isinstance(step, dict) else 'last', warnings
+ 
+ 
+ def analyze_photo(content, mime):
+@@ -44,36 +86,48 @@
+     if not extension or not content or len(content) > 10 * 1024 * 1024:
+         raise ServiceError('JPG·PNG·WEBP 사진 한 장(10MB 이하)을 선택하세요.')
+     boundary = 'Learningflow' + uuid.uuid4().hex
+-    # 원래 파일명에 개인정보가 있을 수 있으므로 서버에는 고정 이름만 전송합니다.
+     body = (f'--{boundary}\r\nContent-Disposition: form-data; name="purpose"\r\n\r\nuser_data\r\n'
+             f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="photo.{extension}"\r\n'
+             f'Content-Type: {mime}\r\n\r\n').encode() + content + f'\r\n--{boundary}--\r\n'.encode()
+-    uploaded = _request('/files', key, body, 'multipart/form-data; boundary=' + boundary)
+-    if not uploaded.get('id'):
+-        raise ServiceError('Upstage 파일 ID를 받지 못했습니다.')
+-    payload = build_job_payload(agent, uploaded['id'])
+-    job = _request('/responses', key, json.dumps(payload).encode())
+-    if not job.get('id'):
+-        raise ServiceError('Upstage 작업 ID를 받지 못했습니다.')
+-    deadline = time.monotonic() + 240
+-    while job.get('status') in ('queued', 'in_progress'):
+-        if time.monotonic() >= deadline:
+-            raise ServiceError('분석 대기 시간이 초과되었습니다. Studio에서 기존 작업을 확인한 후 재시도하세요.')
+-        time.sleep(2)
+-        job = _request('/responses/' + job['id'] + '?include=last', key)
+-    if job.get('status') != 'completed':
+-        raise ServiceError('Studio 작업이 완료되지 않았습니다. Studio에서 실패 원인을 확인하세요.')
+-    texts = []
+-    for output in job.get('output', []):
+-        for part in output.get('content', []):
+-            if part.get('type') == 'output_text':
+-                texts.append(part.get('text', ''))
+-    text = job.get('output_text') or '\n'.join(texts)
++    file_id, result = None, None
+     try:
+-        extracted = json.loads(text)
+-    except (ValueError, TypeError):
+-        extracted = None
+-    return {'job_id': job['id'], 'agent_id': agent,
+-            'config_policy': 'latest', 'config_id': job.get('config_id'),
+-            'text': text, 'extracted': extracted,
+-            'note': '최종 Instruct가 표를 반환하면 JSON은 비어 있습니다. 원문을 확인하고 제품명을 직접 입력하세요.'}
++        uploaded = _request('/files', key, body, 'multipart/form-data; boundary=' + boundary)
++        file_id = uploaded.get('id') if isinstance(uploaded, dict) else None
++        if not file_id or not isinstance(file_id, str):
++            raise ServiceError('Upstage 파일 ID를 받지 못했습니다.')
++        payload = build_job_payload(agent, file_id)
++        job = _request('/responses', key, json.dumps(payload).encode())
++        if not isinstance(job, dict) or not job.get('id'):
++            raise ServiceError('Upstage 작업 ID를 받지 못했습니다.')
++        deadline = time.monotonic() + 240
++        while job.get('status') in ('queued', 'in_progress'):
++            if time.monotonic() >= deadline:
++                raise ServiceError('분석 대기 시간이 초과되었습니다. Studio 작업 상태를 확인하세요.')
++            time.sleep(2)
++            job = _request('/responses/' + quote(str(job['id']), safe='') + '?include=all', key)
++        if job.get('status') != 'completed':
++            raise ServiceError('Studio 작업이 완료되지 않았습니다. 실패 노드를 확인하세요.')
++        text, raw_extracted, selected, warnings = select_output(job)
++        extracted, adapter_warnings = normalize_extraction(raw_extracted)
++        warnings.extend(adapter_warnings)
++        result = {'job_id': job['id'], 'agent_id': agent,
++                  'config_policy': 'latest',
++                  'requested_config_id': None, 'config_id': job.get('config_id'),
++                  'legacy_config_ignored': bool(config.get('UPSTAGE_CONFIG_ID', '').strip()),
++                  'selected_model': selected, 'text': text, 'extracted': extracted,
++                  'raw_extracted': raw_extracted, 'warnings': warnings}
++        return result
++    finally:
++        if file_id:
++            try:
++                deleted = _request('/files/' + quote(file_id, safe=''), key, method='DELETE')
++                if isinstance(deleted, dict) and deleted.get('deleted') is False:
++                    raise ServiceError('파일 삭제 미완료')
++                if result is not None:
++                    result['file_cleanup'] = 'deleted'
++            except Exception:
++                message = 'Upstage 업로드 파일 삭제를 완료하지 못했습니다. Studio에서 파일 보관 상태를 확인하세요.'
++                LOG.warning(message)
++                if result is not None:
++                    result['warnings'].append(message)
++                    result['file_cleanup'] = 'warning'
+--- original/tests/test_core.py
++++ revised/tests/test_core.py
+@@ -77,7 +77,8 @@
+         self.assertFalse(result['ingredients'][0]['duplicate'])
+ 
+     def test_synonyms_not_guessed(self):
+-        self.products[1]['ingredients'][0]['name'] = '가상성분X'
++        # 새 요구사항에서는 공백 차이를 합칩니다. 다른 염형은 여전히 합치지 않습니다.
++        self.products[1]['ingredients'][0]['name'] = '가상성분 X 염산염'
+         self.assertEqual(len(calculate(self.products)['ingredients']), 3)
+ 
+     def test_only_reviewed_scoped_rule(self):
+--- original/tests/test_extraction_adapter.py
++++ revised/tests/test_extraction_adapter.py
+@@ -0,0 +1,88 @@
++import unittest
++from extraction_adapter import normalize_extraction
++from matcher import photo_ingredients, compare_ingredients
++from workflow import AnalysisWorkflow
++from test_workflow import FakeClient
++from test_matcher import detail
++
++
++OBSERVED = {
++    '제품명': '타이레놀 500 밀리그람',
++    '유효성분 목록': '아세트아미노펜 / 500 / mg / 1정',
++    '성인 용법·용량': '', '하루 최대량': '', '중복·병용 관련 주의사항': ''
++}
++
++
++class ExtractionAdapterTests(unittest.TestCase):
++    def test_observed_config7_result(self):
++        canonical, warnings = normalize_extraction(OBSERVED)
++        self.assertEqual(canonical['product_name_raw'], '타이레놀 500 밀리그람')
++        self.assertEqual(canonical['effective_ingredients'][0]['strength_per_unit'], '1정 중 500 mg')
++        self.assertEqual(photo_ingredients(canonical)[0]['strength']['mg'], '500')
++        self.assertEqual(canonical['manufacturer'], '')
++        self.assertEqual(canonical['dosage_and_administration'], '')
++        self.assertFalse(warnings)
++
++    def test_observed_result_full_workflow(self):
++        flow = AnalysisWorkflow(FakeClient(), lambda c, m: {'extracted': OBSERVED})
++        result = flow.analyze_and_match(b'photo', 'image/png')
++        self.assertEqual(result['candidates'][0]['comparison']['status'], '일치')
++        candidate_id = result['candidates'][0]['candidate_id']
++        product = flow.confirm_candidate(candidate_id, True)['product']
++        self.assertEqual(product['ingredients'][0]['amount'], '500')
++
++    def test_three_part_string(self):
++        canonical, _ = normalize_extraction({'제품명':'제품', '유효성분 목록':'아세트아미노펜 / 650 / mg'})
++        row = photo_ingredients(canonical)[0]
++        self.assertEqual(row['strength']['mg'], '650')
++        self.assertIsNone(row['strength']['basis_quantity'])
++
++    def test_multiple_lines_not_collapsed(self):
++        canonical, _ = normalize_extraction({'제품명':['제품'], '유효성분 목록':'성분A / 1 / mg / 1정<br>성분B / 2 / mg / 1정'})
++        self.assertEqual(len(canonical['effective_ingredients']), 2)
++
++    def test_list_of_strings(self):
++        canonical, _ = normalize_extraction({'제품명':'제품','유효성분 목록':['성분A / 1 / mg','성분B / 2 / mg']})
++        self.assertEqual(len(canonical['effective_ingredients']), 2)
++
++    def test_structured_korean_row(self):
++        canonical, _ = normalize_extraction({'제품명':'제품','유효성분 목록':[{'성분명':'성분A','함량':'1','단위':'mg','함량 기준':'1정'}]})
++        self.assertEqual(canonical['effective_ingredients'][0]['strength_per_unit'], '1정 중 1 mg')
++
++    def test_joined_display_format(self):
++        canonical, _ = normalize_extraction({'제품명':'제품','유효성분 목록':'아세트아미노펜 650mg (1정당)'})
++        self.assertEqual(canonical['effective_ingredients'][0]['ingredient_name'], '아세트아미노펜')
++        self.assertEqual(photo_ingredients(canonical)[0]['strength']['basis_unit'], '정')
++
++    def test_unknown_fourth_part_not_dropped(self):
++        canonical, _ = normalize_extraction({'제품명':'제품','유효성분 목록':'성분A / 500 / mg / 한병'})
++        self.assertIsNone(photo_ingredients(canonical)[0]['strength']['mg'])
++
++    def test_english_shape_still_works(self):
++        original = {'product_name_raw':'제품','manufacturer':'회사','effective_ingredients':[
++            {'ingredient_name':'아세트아미노펜','strength_per_unit':'0.5g'}],
++            'dosage_and_administration':'문서 원문','max_daily_dose':'최대량 원문',
++            'do_not_take_with':[{'item_name':'주의 원문'}]}
++        canonical, _ = normalize_extraction(original)
++        self.assertEqual(compare_ingredients(canonical, detail())['status'], '일치')
++        self.assertEqual(canonical['dosage_and_administration'], '문서 원문')
++
++    def test_idempotent_no_evidence_growth(self):
++        first, _ = normalize_extraction(OBSERVED)
++        second, _ = normalize_extraction(first)
++        self.assertEqual(first, second)
++
++    def test_unreadable_not_made_up(self):
++        canonical, warnings = normalize_extraction({'제품명':['제품A','제품B'],'유효성분 목록':[None]})
++        self.assertEqual(canonical['product_name_raw'], '')
++        self.assertEqual(canonical['effective_ingredients'], [])
++        self.assertTrue(warnings)
++
++    def test_missing_basis_cannot_use_photo_to_fill_official(self):
++        canonical, _ = normalize_extraction(OBSERVED)
++        result = compare_ingredients(canonical, detail(basis='미확인'))
++        self.assertFalse(result['calculation_ready'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- original/tests/test_latest_refresh.py
++++ revised/tests/test_latest_refresh.py
+@@ -0,0 +1,81 @@
++import io
++import json
++import unittest
++from unittest.mock import Mock, patch
++
++import main
++from studio_client import analyze_photo
++
++
++class LatestRefreshTests(unittest.TestCase):
++    def test_status_always_latest_even_with_old_pin(self):
++        with patch('main.settings', return_value={'UPSTAGE_CONFIG_ID':'7','UPSTAGE_AGENT_ID':'agt_test','UPSTAGE_API_KEY':'secret-test'}):
++            status = main.status_payload()
++        self.assertEqual(status['config_policy'], 'latest')
++        self.assertIsNone(status['requested_config_id'])
++        self.assertTrue(status['legacy_config_ignored'])
++        self.assertNotIn('secret-test', json.dumps(status))
++
++    def test_status_rereads_settings(self):
++        with patch('main.settings', side_effect=[{'UPSTAGE_AGENT_ID':'agt_one'},{'UPSTAGE_AGENT_ID':'agt_two'}]):
++            self.assertEqual(main.status_payload()['agent_id'], 'agt_one')
++            self.assertEqual(main.status_payload()['agent_id'], 'agt_two')
++
++    def test_refresh_has_no_external_analysis_calls(self):
++        handler = object.__new__(main.Handler)
++        handler.headers = {'Host':'127.0.0.1:8767'}
++        handler.path = '/api/status'
++        sent = []
++        handler.send = lambda status, data: sent.append((status, data))
++        with patch('main.ALLOWED_HOST','127.0.0.1:8767'), patch('main.WORKFLOW') as flow, patch('main.analyze_photo') as analyze:
++            handler.do_GET()
++            flow.analyze_and_match.assert_not_called()
++            analyze.assert_not_called()
++        self.assertEqual(sent[0][1]['refresh_behavior'], 'status_only')
++
++    def test_client_revision_changes_with_assets(self):
++        with patch('main.Path.read_bytes', side_effect=[b'html',b'js',b'css',b'html',b'updated-js',b'css']):
++            first = main.client_revision()
++            self.assertNotEqual(first, main.client_revision())
++
++    def test_page_includes_fresh_asset_revision(self):
++        handler = object.__new__(main.Handler)
++        handler.headers = {'Host':'127.0.0.1:8767'}
++        handler.path = '/'
++        sent = []
++        handler.send = lambda *args: sent.append(args)
++        with patch('main.ALLOWED_HOST','127.0.0.1:8767'):
++            handler.do_GET()
++        self.assertIn(b'/app.js?v=',sent[0][1])
++        self.assertIn(b'/style.css?v=',sent[0][1])
++
++    def test_no_cache_headers(self):
++        handler = object.__new__(main.Handler)
++        handler.send_response = Mock()
++        handler.end_headers = Mock()
++        headers = {}
++        handler.send_header = lambda k,v:headers.update({k:v})
++        handler.wfile = io.BytesIO()
++        handler.send(200, {'ok':True})
++        self.assertIn('no-store', headers['Cache-Control'])
++        self.assertEqual(headers['Pragma'], 'no-cache')
++        self.assertEqual(headers['Expires'], '0')
++
++    def test_analysis_rereads_agent_each_time_and_never_pins(self):
++        models = []
++        def request(path, key, payload=None, content_type=None, method=None):
++            if path == '/files': return {'id':'file-test'}
++            if method == 'DELETE': return {'deleted':True}
++            body = json.loads(payload)
++            models.append(body['model'])
++            self.assertNotIn('config_id',body)
++            return {'id':'job-test','status':'completed','output_text':'{}'}
++        configs = [{'UPSTAGE_API_KEY':'test','UPSTAGE_AGENT_ID':'agt_first','UPSTAGE_CONFIG_ID':'1'},
++                   {'UPSTAGE_API_KEY':'test','UPSTAGE_AGENT_ID':'agt_second','UPSTAGE_CONFIG_ID':'2'}]
++        with patch('studio_client.settings',side_effect=configs),patch('studio_client._request',side_effect=request):
++            analyze_photo(b'photo','image/png')
++            analyze_photo(b'photo','image/png')
++        self.assertEqual(models,['agt_first','agt_second'])
++
++
++if __name__ == '__main__': unittest.main()
+--- original/tests/test_matcher.py
++++ revised/tests/test_matcher.py
+@@ -0,0 +1,119 @@
++import unittest
++from matcher import normalize_name, parse_strength, parse_basis, compare_ingredients, official_calculation_product
++from calculator import calculate
++from mfds_client import ServiceError
++
++
++def photo(amount='500mg', name='아세트아미노펜'):
++    return {'product_name_raw': '가상 제품', 'manufacturer': '가상제약',
++            'effective_ingredients': [{'ingredient_name': name, 'base_ingredient_name': name,
++                                       'strength_per_unit': amount, 'ingredient_standard': 'KP'}]}
++
++
++def detail(qnt='500', unit='mg', name='아세트아미노펜', code='123', basis='1정 중'):
++    return {'product': {'ITEM_SEQ': code, 'ITEM_NAME': '가상 제품', 'ENTP_NAME': '가상제약',
++                         'TOTAL_CONTENT': basis},
++            'ingredients_raw': [{'MTRAL_NM': name, 'QNT': qnt, 'INGD_UNIT_CD': unit,
++                                 'MTRAL_CODE': 'ingredient-test', 'CPNT_CTNT_CONT': basis}],
++            'warnings': [], 'source': 'https://example.test'}
++
++
++class MatcherTests(unittest.TestCase):
++    def test_spaces_standard_case(self):
++        self.assertEqual(normalize_name(' Acetaminophen ( USP ) '), 'acetaminophen')
++        self.assertEqual(normalize_name('아세트 아미노펜(KP)'), '아세트아미노펜')
++
++    def test_meaningful_parentheses_preserved(self):
++        self.assertNotEqual(normalize_name('성분(염산염)'), normalize_name('성분'))
++
++    def test_supported_strength_formats(self):
++        for value in ['500mg','500 밀리그램','0.5g','1정 중 500mg']:
++            with self.subTest(value=value):
++                self.assertEqual(parse_strength(value)['mg'], '500' if '0.5' not in value else '500.0')
++
++    def test_micrograms(self):
++        self.assertEqual(parse_strength('500마이크로그램')['mg'], '0.500')
++
++    def test_unknown_and_ambiguous_strength(self):
++        for value in [None, {}, '', '500', '500 IU', 'NaNmg', '-1mg', '500mg + 50mg', '500mg/100mL', '1일 500mg']:
++            with self.subTest(value=value):
++                self.assertIsNone(parse_strength(value)['mg'])
++
++    def test_basis(self):
++        self.assertEqual(parse_basis('1정(총량 700mg) 중'), ('1','정'))
++        self.assertEqual(parse_basis('100mL 중'), ('100','mL'))
++        self.assertEqual(parse_basis('용량 불명'), (None,None))
++
++    def test_basis_conflict(self):
++        d=detail();d['product']['TOTAL_CONTENT']='2정 중'
++        result=compare_ingredients(photo(),d)
++        self.assertFalse(result['calculation_ready'])
++
++    def test_exact_decimal_match(self):
++        result=compare_ingredients(photo('0.5g'),detail())
++        self.assertEqual(result['status'],'일치')
++        self.assertTrue(result['calculation_ready'])
++
++    def test_no_tolerance(self):
++        result=compare_ingredients(photo('499.999mg'),detail())
++        self.assertEqual(result['rows'][0]['status'],'함량 불일치')
++
++    def test_per_unit_basis_conversion(self):
++        result=compare_ingredients(photo('2정 중 1000mg'),detail())
++        self.assertEqual(result['rows'][0]['status'],'일치')
++
++    def test_different_basis_dimension_unknown(self):
++        self.assertEqual(compare_ingredients(photo('100mL 중 500mg'),detail())['rows'][0]['status'],'함량 미확인')
++
++    def test_photo_only_official_only(self):
++        result=compare_ingredients(photo(name='다른 성분'),detail())
++        self.assertEqual([r['status'] for r in result['rows']],['사진에만 있음','공식에만 있음'])
++
++    def test_unknown_amount(self):
++        self.assertEqual(compare_ingredients(photo('500'),detail())['rows'][0]['status'],'함량 미확인')
++
++    def test_missing_photo_fields(self):
++        for data in [None,{}, {'effective_ingredients':None},{'effective_ingredients':[None,{}]}]:
++            with self.subTest(data=data):
++                self.assertEqual(compare_ingredients(data,detail())['status'],'확인 필요')
++
++    def test_no_data_not_match(self):
++        self.assertEqual(compare_ingredients({}, {})['status'],'확인 필요')
++
++    def test_unknown_official_unit(self):
++        result=compare_ingredients(photo(),detail(unit='001'))
++        self.assertFalse(result['calculation_ready'])
++        self.assertEqual(result['rows'][0]['status'],'함량 미확인')
++
++    def test_calculation_uses_official_amount(self):
++        p=photo('650mg');d=detail('500');r=compare_ingredients(p,d)
++        product=official_calculation_product(d,r,p)
++        self.assertEqual(product['ingredients'][0]['amount'],'500')
++        self.assertEqual(product['ingredients'][0]['ingredient_code'],'ingredient-test')
++        self.assertIn('650mg',product['ingredients'][0]['evidence'])
++
++    def test_unclear_official_basis_blocks(self):
++        d=detail(basis='불명');r=compare_ingredients(photo(),d)
++        with self.assertRaises(ServiceError):
++            official_calculation_product(d,r,photo())
++
++    def test_official_duplicate_blocks(self):
++        d=detail();d['ingredients_raw']*=2
++        self.assertFalse(compare_ingredients(photo(),d)['calculation_ready'])
++
++    def test_name_grouping(self):
++        d=detail(name=' Acetaminophen (USP) ');r=compare_ingredients(photo(name='acetaminophen'),d)
++        p=official_calculation_product(d,r,photo());p['ingredients'][0]['ingredient_code']='';p['quantity']='1'
++        import copy
++        q=copy.deepcopy(p);q['code']='456';q['ingredients'][0]['name']='acetaminophen'
++        result=calculate([p,q])
++        self.assertEqual(len(result['ingredients']),1)
++        self.assertEqual(result['ingredients'][0]['matching'],'이름 기준으로 묶음')
++
++    def test_optional_product_codes(self):
++        p=official_calculation_product(detail(),compare_ingredients(photo(),detail()),photo());p['quantity']='1'
++        rule={'reviewed':True,'ingredient_code':'ingredient-test','mode':'single','population':'adult',
++              'reviewer':'test','reviewed_at':'2026-10-15','source_url':'https://example.test','limit_mg':'400'}
++        self.assertEqual(calculate([p],rules=[rule])['ingredients'][0]['criterion_status'],'exceeded')
++        rule['product_codes']=[]
++        self.assertEqual(calculate([p],rules=[rule])['ingredients'][0]['criterion_status'],'exceeded')
+--- original/tests/test_studio.py
++++ revised/tests/test_studio.py
+@@ -14,10 +14,12 @@
+ 
+     def test_each_analysis_creates_new_job(self):
+         calls = []
+-        def request(path, key, payload=None, content_type='application/json'):
++        def request(path, key, payload=None, content_type='application/json', method=None):
+             calls.append((path, payload))
+             if path == '/files':
+                 return {'id': 'file-test'}
++            if method == 'DELETE':
++                return {'deleted': True}
+             self.assertNotIn('config_id', json.loads(payload))
+             return {'id': 'job-test', 'status': 'completed', 'config_id': '8',
+                     'output_text': '{"product_name":"test"}'}
+@@ -27,6 +29,7 @@
+             for _ in range(2):
+                 result = analyze_photo(b'test-photo', 'image/png')
+                 self.assertEqual(result['config_policy'], 'latest')
++                self.assertTrue(result['legacy_config_ignored'])
+                 self.assertEqual(result['config_id'], '8')
+         self.assertEqual(sum(path == '/responses' for path, _ in calls), 2)
+ 
+--- original/tests/test_studio_revised.py
++++ revised/tests/test_studio_revised.py
+@@ -0,0 +1,93 @@
++import json
++import unittest
++from unittest.mock import patch
++from studio_client import analyze_photo, build_job_payload, select_output
++from mfds_client import ServiceError
++
++
++def step(model,text):
++    return {'model':model,'content':[{'type':'output_text','text':text}]}
++
++
++class StudioRevisedTests(unittest.TestCase):
++    def test_all_steps_requested(self):
++        self.assertEqual(build_job_payload('agt_test','file-test')['include'],['all'])
++
++    def test_config_pin_ignored_for_always_latest(self):
++        self.assertNotIn('config_id',build_job_payload('agt_test','file-test',' 5 '))
++        self.assertNotIn('config_id',build_job_payload('agt_test','file-test','  '))
++
++    def test_extract_before_instruct(self):
++        result=select_output({'output':[step('step_parse','{}'),step('step_Extract','{"product_name_raw":"Extract"}'),step('instruct','{"product_name_raw":"Instruct"}')]})
++        self.assertEqual(result[1]['product_name_raw'],'Extract')
++
++    def test_final_fallback(self):
++        result=select_output({'output':[step('parse','{}'),step('instruct','{"product_name_raw":"last"}')]})
++        self.assertEqual(result[1]['product_name_raw'],'last')
++
++    def test_bad_extract_warns(self):
++        result=select_output({'output':[step('extract','not json'),step('instruct','{}')]})
++        self.assertTrue(result[3])
++
++    def test_null_output_defensive(self):
++        result=select_output({'output':[None,{'model':'extract','content':None}]})
++        self.assertIsNone(result[1])
++
++    def test_delete_success_and_latest(self):
++        calls=[]
++        def request(path,key,payload=None,content_type=None,method=None):
++            calls.append((path,method))
++            if path=='/files':return {'id':'file-test'}
++            if method=='DELETE':return {'deleted':True}
++            return {'id':'job-test','status':'completed','output':[step('extract','{}')]}
++        with patch('studio_client.settings',return_value={'UPSTAGE_API_KEY':'test','UPSTAGE_AGENT_ID':'agt_test'}),patch('studio_client._request',side_effect=request):
++            result=analyze_photo(b'photo','image/png')
++        self.assertIn(('/files/file-test','DELETE'),calls)
++        self.assertEqual(result['file_cleanup'],'deleted')
++        self.assertEqual(result['config_policy'],'latest')
++
++    def test_delete_on_failed_job(self):
++        methods=[]
++        def request(path,key,payload=None,content_type=None,method=None):
++            methods.append(method)
++            if path=='/files':return {'id':'file-test'}
++            if method=='DELETE':return {'deleted':True}
++            return {'id':'job-test','status':'failed'}
++        with patch('studio_client.settings',return_value={'UPSTAGE_API_KEY':'test','UPSTAGE_AGENT_ID':'agt_test'}),patch('studio_client._request',side_effect=request):
++            with self.assertRaises(ServiceError):analyze_photo(b'photo','image/png')
++        self.assertIn('DELETE',methods)
++
++    def test_delete_on_create_exception(self):
++        deleted=[]
++        def request(path,key,payload=None,content_type=None,method=None):
++            if path=='/files':return {'id':'file-test'}
++            if method=='DELETE':deleted.append(True);return {'deleted':True}
++            raise ServiceError('작업 생성 실패')
++        with patch('studio_client.settings',return_value={'UPSTAGE_API_KEY':'test','UPSTAGE_AGENT_ID':'agt_test'}),patch('studio_client._request',side_effect=request):
++            with self.assertRaisesRegex(ServiceError,'작업 생성 실패'):analyze_photo(b'photo','image/png')
++        self.assertEqual(deleted,[True])
++
++    def test_delete_failure_is_warning_and_redacted(self):
++        def request(path,key,payload=None,content_type=None,method=None):
++            if path=='/files':return {'id':'file-test'}
++            if method=='DELETE':raise RuntimeError('secret-token-must-not-leak')
++            return {'id':'job-test','status':'completed','output':[step('extract','{}')]}
++        with patch('studio_client.settings',return_value={'UPSTAGE_API_KEY':'secret-token-must-not-leak','UPSTAGE_AGENT_ID':'agt_test'}),patch('studio_client._request',side_effect=request),self.assertLogs('studio_client',level='WARNING') as logs:
++            result=analyze_photo(b'photo','image/png')
++        self.assertEqual(result['file_cleanup'],'warning')
++        self.assertNotIn('secret-token-must-not-leak',str(result)+str(logs.output))
++
++    def test_polling_all_and_cleanup(self):
++        paths=[]
++        def request(path,key,payload=None,content_type=None,method=None):
++            paths.append(path)
++            if path=='/files':return {'id':'file-test'}
++            if method=='DELETE':return {'deleted':True}
++            if path=='/responses':return {'id':'job-test','status':'queued'}
++            return {'id':'job-test','status':'completed','output':[step('extract','{}')]}
++        with patch('studio_client.settings',return_value={'UPSTAGE_API_KEY':'test','UPSTAGE_AGENT_ID':'agt_test'}),patch('studio_client._request',side_effect=request),patch('studio_client.time.sleep'):
++            analyze_photo(b'photo','image/png')
++        self.assertIn('/responses/job-test?include=all',paths)
++
++
++if __name__=='__main__':unittest.main()
+--- original/tests/test_ui.cjs
++++ revised/tests/test_ui.cjs
+@@ -0,0 +1,58 @@
++// Python API 대신 가짜 fetch와 최소 DOM을 사용한 화면 확인 흐름 테스트.
++const vm = require('node:vm');
++const fs = require('node:fs');
++const assert = require('node:assert/strict');
++const elements = new Map();
++function element(id) {
++  if (!elements.has(id)) elements.set(id, {textContent:'',innerHTML:'',hidden:false,disabled:false,checked:false,value:'single',dataset:{},open:false,
++    scrollIntoView(){},showModal(){this.open=true;},close(){this.open=false;}});
++  return elements.get(id);
++}
++const requests=[];
++const statusRequests=[];
++let answer={};
++const context={console, Blob, URL, setTimeout,
++  document:{querySelector:element,querySelectorAll:()=>[],createElement:()=>({click(){}})},
++  fetch:async(path,init)=>{
++    if(path==='/api/status'){statusRequests.push(init);return {json:async()=>({token:'test',config_policy:'latest'})};}
++    requests.push({path,data:JSON.parse(init.body)});
++    return {ok:true,json:async()=>answer};
++  }};
++vm.createContext(context);
++vm.runInContext(fs.readFileSync('static/app.js','utf8'),context);
++(async()=>{
++  const candidate={candidate_id:'candidate-test',product:{ITEM_SEQ:'123',ITEM_NAME:'가상 제품'},comparison:{status:'확인 필요',calculation_ready:true,warnings:[],rows:[{name:'가상 성분',status:'함량 불일치',photo:{strength:{raw:'650mg',mg:'650'}},official:{strength:{raw:'500mg',mg:'500'}}}]}};
++  context.fixture=candidate;
++  vm.runInContext('candidates=[fixture];selectCandidate(0)',context);
++  vm.runInContext('renderPhotoSummary({product_name_raw:"현재 제품",dosage_and_administration:"새 용법 원문",effective_ingredients:[{ingredient_name:"성분A",strength_per_unit:"1정 중 500mg"}]},{config_policy:"latest",selected_model:"step_extract"})',context);
++  assert(element('#photoSummary').innerHTML.includes('새 용법 원문'));
++  assert(element('#photoSummary').innerHTML.includes('1정 중 500mg'));
++  assert(element('#analysisVersion').textContent.includes('step_extract'));
++  assert.equal(vm.runInContext('basket.length',context),0,'후보 선택만으로 추가 금지');
++  element('#reviewed').checked=true;
++  await element('#addProduct').onclick();
++  assert.equal(element('#mismatchDialog').open,true,'불일치 추가 확인 모달');
++  assert.equal(requests.length,0,'추가 확인 전 서버 승인 요청 금지');
++  await element('#mismatchAccept').onclick();
++  assert.equal(requests.length,0,'추가 체크 없으면 요청 금지');
++  element('#mismatchReviewed').checked=true;
++  answer={approval_id:'approval-test',product:{code:'123',name:'가상 제품',quantity:0,quantity_unit:'정',ingredients:[{name:'공식 성분',amount:'500'}]}};
++  await element('#mismatchAccept').onclick();
++  assert.equal(requests[0].path,'/api/confirm-match');
++  assert.equal(requests[0].data.mismatch_ack,true);
++  assert.equal(vm.runInContext('basket[0].ingredients[0].amount',context),'500');
++  answer={notice:'확인 필요',ingredients:[]};
++  element('#scenarioConsent').checked=true;
++  await element('#evaluate').onclick();
++  const sent=requests.at(-1);
++  assert.equal(sent.path,'/api/evaluate');
++  assert.deepEqual(Object.keys(sent.data.products[0]).sort(),['approval_id','quantity']);
++  assert.equal(vm.runInContext('lastReport!==null',context),true);
++  element('#mode').onchange();
++  assert.equal(vm.runInContext('lastReport',context),null);
++  const callsBeforeRefresh = requests.length;
++  await vm.runInContext('start()',context);
++  assert.equal(requests.length,callsBeforeRefresh,'상태 갱신 시 사진 분석 요청 금지');
++  assert(statusRequests.every(options=>options.cache==='no-store'),'상태 조회 캐시 금지');
++  console.log('PASS: 후보 선택·추가 확인·공식값·계산 요청 경계·입력 변경 무효화');
++})().catch(error=>{console.error(error);process.exitCode=1;});
+--- original/tests/test_workflow.py
++++ revised/tests/test_workflow.py
+@@ -0,0 +1,122 @@
++import base64
++import copy
++import io
++import json
++import unittest
++from unittest.mock import patch
++
++import main
++from workflow import AnalysisWorkflow
++from mfds_client import ServiceError
++from test_matcher import photo, detail
++
++
++class FakeClient:
++    def __init__(self, products=None, details=None):
++        self.products = products if products is not None else [detail()['product']]
++        self.details = details or {'123':detail()}
++    def search(self,name,page=1,**kwargs):
++        return {'items':self.products,'total':len(self.products),'source':'https://example.test'}
++    def detail(self,code):
++        return copy.deepcopy(self.details[code])
++
++
++class WorkflowTests(unittest.TestCase):
++    def setUp(self):
++        self.flow=AnalysisWorkflow(FakeClient(),lambda content,mime:{'extracted':photo(),'warnings':[]})
++
++    def test_new_route_success(self):
++        with patch('main.WORKFLOW',self.flow):
++            result=main.dispatch_post('/api/analyze-and-match',{'base64':base64.b64encode(b'photo').decode(),'mime':'image/png','consent':True})
++        self.assertEqual(len(result['candidates']),1)
++        self.assertEqual(result['candidates'][0]['comparison']['status'],'일치')
++        self.assertNotIn('selected_candidate',result)
++
++    def test_no_result_keeps_extraction(self):
++        self.flow.client=FakeClient([])
++        result=self.flow.analyze_and_match(b'photo','image/png')
++        self.assertEqual(result['status'],'제품을 찾지 못함')
++        self.assertEqual(result['photo_extracted']['product_name_raw'],'가상 제품')
++        self.assertTrue(result['photo_id'])
++
++    def test_no_name(self):
++        result=self.flow.match_extracted({'effective_ingredients':[]})
++        self.assertEqual(result['status'],'제품을 찾지 못함')
++
++    def test_search_error_keeps_extraction(self):
++        with patch.object(self.flow.client,'search',side_effect=ServiceError('인증 오류')):
++            result=self.flow.match_extracted(photo())
++        self.assertEqual(result['status'],'확인 필요')
++        self.assertEqual(result['photo_extracted']['product_name_raw'], photo()['product_name_raw'])
++        self.assertEqual(result['photo_extracted']['effective_ingredients'][0]['source_raw'],
++                         photo()['effective_ingredients'][0])
++
++    def test_ranking(self):
++        d1=detail(code='101');d1['product']['ENTP_NAME']='다른제약'
++        d2=detail(qnt='650',code='102')
++        d3=detail(code='103')
++        self.flow.client=FakeClient([d1['product'],d2['product'],d3['product']],{'101':d1,'102':d2,'103':d3})
++        result=self.flow.match_extracted(photo())
++        self.assertEqual([c['product']['ITEM_SEQ'] for c in result['candidates']],['103','102','101'])
++
++    def test_explicit_confirmation_required(self):
++        result=self.flow.match_extracted(photo());candidate=result['candidates'][0]['candidate_id']
++        with self.assertRaises(ServiceError):
++            self.flow.confirm_candidate(candidate,False)
++        confirmed=self.flow.confirm_candidate(candidate,True)
++        self.assertTrue(confirmed['approval_id'])
++
++    def test_mismatch_needs_second_ack(self):
++        result=self.flow.match_extracted(photo('650mg'));candidate=result['candidates'][0]['candidate_id']
++        with self.assertRaises(ServiceError):
++            self.flow.confirm_candidate(candidate,True)
++        result=self.flow.confirm_candidate(candidate,True,True)
++        self.assertEqual(result['product']['ingredients'][0]['amount'],'500')
++
++    def test_unknown_official_cannot_override(self):
++        self.flow.client=FakeClient(details={'123':detail(unit='001')})
++        candidate=self.flow.match_extracted(photo())['candidates'][0]['candidate_id']
++        with self.assertRaises(ServiceError):
++            self.flow.confirm_candidate(candidate,True,True)
++
++    def test_client_tampering_ignored(self):
++        candidate=self.flow.match_extracted(photo())['candidates'][0]['candidate_id']
++        approval=self.flow.confirm_candidate(candidate,True)
++        result=self.flow.evaluate([{'approval_id':approval['approval_id'],'quantity':'1',
++                                   'ingredients':[{'amount':'999999'}],'name':'改変'}],'single',[])
++        self.assertEqual(result['ingredients'][0]['total_mg'],'500')
++
++    def test_no_approval_no_calculation(self):
++        with self.assertRaises(ServiceError):
++            self.flow.evaluate([{'quantity':'1','ingredients':[]}],'single',[])
++
++    def test_manual_search_preserves_photo(self):
++        first=self.flow.match_extracted(photo('650mg'))
++        result=self.flow.search_again(first['photo_id'],'재검색')
++        self.assertEqual(result['candidates'][0]['comparison']['rows'][0]['status'],'함량 불일치')
++
++    def test_ttl(self):
++        first=self.flow.match_extracted(photo())
++        with patch('workflow.time.monotonic',return_value=10**15):
++            with self.assertRaises(ServiceError):
++                self.flow.confirm_candidate(first['candidates'][0]['candidate_id'],True)
++
++    def test_route_rejects_no_consent(self):
++        with self.assertRaises(ServiceError):
++            main.dispatch_post('/api/analyze-and-match',{'base64':'eA==','consent':False})
++
++    def test_route_rejects_bad_base64(self):
++        with self.assertRaises(ServiceError):
++            main.dispatch_post('/api/analyze-and-match',{'base64':'%%','consent':True})
++
++    def test_http_route_delegates(self):
++        handler=object.__new__(main.Handler)
++        raw=json.dumps({'base64':'eA==','mime':'image/png','consent':True}).encode()
++        handler.headers={'Host':'127.0.0.1:8767','Origin':'http://127.0.0.1:8767',
++                         'X-App-Token':main.TOKEN,'Content-Length':str(len(raw))}
++        handler.path='/api/analyze-and-match';handler.rfile=io.BytesIO(raw)
++        sent=[];handler.send=lambda status,payload:sent.append((status,payload))
++        with patch('main.ALLOWED_HOST','127.0.0.1:8767'),patch('main.WORKFLOW',self.flow):
++            handler.do_POST()
++        self.assertEqual(sent[0][0],200)
++        self.assertEqual(sent[0][1]['candidates'][0]['comparison']['status'],'일치')
+--- original/workflow.py
++++ revised/workflow.py
+@@ -0,0 +1,123 @@
++"""대조·후보 정렬·명시적 확인과 공식 데이터 계산 경계를 담당합니다."""
++import copy
++import secrets
++import threading
++import time
++
++from matcher import compare_ingredients, manufacturer_matches, official_calculation_product, text
++from mfds_client import MFDSClient, ServiceError
++from studio_client import analyze_photo
++from calculator import calculate
++from extraction_adapter import normalize_extraction
++
++
++class AnalysisWorkflow:
++    def __init__(self, client=None, analyzer=None):
++        self.client = client or MFDSClient()
++        self.analyzer = analyzer or analyze_photo
++        self.records = {}
++        self.lock = threading.Lock()
++
++    def _put(self, kind, value):
++        with self.lock:
++            now = time.monotonic()
++            self.records = {k: v for k, v in self.records.items() if now - v[0] < 1800}
++            if len(self.records) >= 300:
++                oldest = min(self.records, key=lambda k: self.records[k][0])
++                del self.records[oldest]
++            token = secrets.token_urlsafe(24)
++            self.records[token] = (now, kind, copy.deepcopy(value))
++            return token
++
++    def _get(self, token, kind):
++        if not isinstance(token, str):
++            raise ServiceError('확인 정보가 없습니다. 후보를 다시 조회하세요.')
++        with self.lock:
++            record = self.records.get(token)
++            if not record or record[1] != kind or time.monotonic() - record[0] >= 1800:
++                raise ServiceError('확인 정보가 만료되었습니다. 후보를 다시 조회하세요.')
++            return copy.deepcopy(record[2])
++
++    def analyze_and_match(self, content, mime):
++        studio = self.analyzer(content, mime)
++        extracted = studio.get('extracted')
++        extracted = extracted if isinstance(extracted, dict) else {}
++        result = self.match_extracted(extracted)
++        result['studio'] = studio
++        return result
++
++    def match_extracted(self, extracted, name=None, page=1):
++        extracted, extraction_warnings = normalize_extraction(extracted)
++        photo_id = self._put('photo', extracted)
++        name = text(name) if name is not None else text(extracted.get('product_name_raw'))
++        if not name:
++            return {'status': '제품을 찾지 못함', 'reason': '사진의 제품명이 미확인입니다. 직접 검색하세요.',
++                    'photo_extracted': extracted, 'photo_id': photo_id, 'candidates': [], 'total': 0,
++                    'warnings': extraction_warnings}
++        try:
++            found = self.client.search(name, page, page_size=10)
++        except ServiceError as error:
++            return {'status': '확인 필요', 'reason': str(error), 'photo_extracted': extracted,
++                    'photo_id': photo_id, 'candidates': [], 'total': 0, 'warnings': extraction_warnings}
++        candidates, warnings = [], list(extraction_warnings)
++        # 후보별 상세 호출 폭증을 막고, 일부만 평가되면 명확히 알립니다.
++        limit = 10
++        seen = set()
++        for item in found['items'][:limit]:
++            code = str(item.get('ITEM_SEQ', ''))
++            if not code or code in seen:
++                continue
++            seen.add(code)
++            try:
++                detail = self.client.detail(code)
++                comparison = compare_ingredients(extracted, detail)
++            except ServiceError:
++                detail = {'product': item, 'ingredients_raw': [], 'warnings': ['공식 상세 조회 실패. 확인 필요.'],
++                          'source': found.get('source', '')}
++                comparison = compare_ingredients(extracted, detail)
++            if extraction_warnings:
++                comparison['warnings'].extend(extraction_warnings)
++                comparison['status'] = '확인 필요'
++                comparison['all_match'] = False
++            manufacturer_match = manufacturer_matches(extracted.get('manufacturer'), detail['product'].get('ENTP_NAME'))
++            record = {'detail': detail, 'comparison': comparison, 'extracted': extracted}
++            candidate_id = self._put('candidate', record)
++            candidates.append({'candidate_id': candidate_id, 'product': detail['product'],
++                               'manufacturer_match': manufacturer_match,
++                               'comparison': comparison, 'source': detail.get('source', '')})
++        candidates.sort(key=lambda c: (not c['manufacturer_match'], not c['comparison']['all_match'],
++                                       str(c['product'].get('ITEM_SEQ', ''))))
++        if found['total'] > len(candidates):
++            warnings.append('이번 페이지의 최대 10개 후보를 대조했습니다. 다른 후보는 제품명을 좁혀 검색하거나 다음 페이지에서 확인하세요.')
++        return {'status': '후보 확인 필요' if candidates else '제품을 찾지 못함',
++                'reason': '' if candidates else '해당 제품명으로 공식 제품을 찾지 못했습니다. 직접 검색하세요.',
++                'photo_extracted': extracted, 'photo_id': photo_id, 'candidates': candidates,
++                'total': found['total'], 'page': page, 'warnings': warnings}
++
++    def search_again(self, photo_id, name, page=1):
++        extracted = self._get(photo_id, 'photo') if photo_id else {}
++        return self.match_extracted(extracted, name=name, page=page)
++
++    def confirm_candidate(self, candidate_id, confirmed, mismatch_ack=False):
++        if confirmed is not True:
++            raise ServiceError('제품과 공식 성분을 확인한 후 확인 버튼을 누르세요.')
++        record = self._get(candidate_id, 'candidate')
++        comparison = record['comparison']
++        if comparison['status'] != '일치' and mismatch_ack is not True:
++            raise ServiceError('불일치·누락 항목을 다시 확인하고 추가 확인을 완료하세요.')
++        product = official_calculation_product(record['detail'], comparison, record['extracted'])
++        approval = self._put('approved', product)
++        return {'approval_id': approval, 'product': product, 'comparison_status': comparison['status']}
++
++    def evaluate(self, submitted, mode, rules):
++        if not isinstance(submitted, list) or not submitted or len(submitted) > 30:
++            raise ServiceError('확인된 제품을 1~30개 추가하세요.')
++        canonical = []
++        for item in submitted:
++            if not isinstance(item, dict):
++                raise ServiceError('계산 입력을 확인하세요.')
++            product = self._get(item.get('approval_id'), 'approved')
++            # 클라이언트가 바꾼 성분명·함량·코드는 사용하지 않습니다.
++            product['quantity'] = item.get('quantity')
++            canonical.append(product)
++        return calculate(canonical, mode, rules)
