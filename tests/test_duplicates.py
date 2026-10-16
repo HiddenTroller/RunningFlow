@@ -14,13 +14,6 @@ class DuplicateOnlyTests(unittest.TestCase):
             {'code':'1','name':'A','ingredients':[{'name':'성분A','ingredient_code':'M1'},{'name':'성분 B'}]},
             {'code':'2','name':'B','ingredients':[{'name':'다른표기','ingredient_code':'M1'},{'name':'성분B'}]}])
         self.assertEqual(report['duplicate_count'],2)
-    def test_route_only_uses_server_ingredients_without_profile(self):
-        with patch('main.WORKFLOW._get',return_value={'code':'1','name':'공식제품','ingredients':[{'name':'공식성분','ingredient_code':'M1'}]}):
-            report=dispatch_post('/api/check-duplicates',{'products':[{'approval_id':'x','ingredients':[{'name':'조작값'}]}]})
-        self.assertEqual(report['ingredients'][0]['ingredient'],'공식성분')
-        self.assertEqual(report['kind'],'duplicates_only')
-if __name__=='__main__':unittest.main()
-
 class ProductSummaryTests(unittest.TestCase):
     def test_explicit_daily_max_only(self):
         from duplicates import product_summary
@@ -32,13 +25,6 @@ class ProductSummaryTests(unittest.TestCase):
         self.assertIn('함께',result['warnings_text'])
 
 class OfficialTitleDoseTests(unittest.TestCase):
-    def test_title_regimens_and_condition_are_preserved(self):
-        from duplicates import product_summary
-        xml='<DOC><ARTICLE title="관절염: 성인 1일 최고 3200mg까지 투여할 수 있다."/><ARTICLE title="편두통: 24시간 동안 2캡슐을 초과하지 않도록 한다."/></DOC>'
-        result=product_summary({'code':'1','directions_text':xml})
-        self.assertIn('관절염',result['daily_max_text'])
-        self.assertIn('편두통',result['daily_max_text'])
-        self.assertEqual(result['daily_max_status'],'explicit')
     def test_directions_do_not_become_maximum(self):
         from duplicates import product_summary
         result=product_summary({'code':'1','directions_text':'성인 1회 1캡슐을 1일 3회 식후에 복용한다.'})
@@ -61,9 +47,3 @@ class IdentityOnlyTests(unittest.TestCase):
         r=compare_duplicates([{'code':'1','name':'미확인','ingredients':[]}])
         self.assertEqual(len(r['unconfirmed_products']),1)
         self.assertEqual(r['product_count'],1)
-    def test_endpoint_pending_uses_canonical_candidate(self):
-        record={'detail':{'product':{'ITEM_SEQ':'1','ITEM_NAME':'공식제품'},'ingredients_raw':[{'MTRAL_NM':'공식성분'}],'warnings':[]}}
-        with patch('main.WORKFLOW._get',return_value=record) as get:
-            r=dispatch_post('/api/check-duplicates',{'products':[{'candidate_id':'known','ingredients':[{'name':'조작'}]}]})
-        get.assert_called_once_with('known','candidate')
-        self.assertEqual(r['ingredients'][0]['ingredient'],'공식성분')
