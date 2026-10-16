@@ -24,6 +24,8 @@ from workflow import AnalysisWorkflow
 
 TOKEN = secrets.token_urlsafe(32)
 ALLOWED_HOST = ''
+PUBLIC = False  # Render 등 공개 배포: https, 0.0.0.0 바인딩, 보완 데이터 등록 차단
+PASSWORD = ''   # APP_PASSWORD. 값이 있으면 모든 요청에 Basic 인증을 요구합니다.
 STATIC = ROOT / 'static'
 WORKFLOW = AnalysisWorkflow()
 
@@ -98,6 +100,9 @@ def dispatch_post(path, data):
     if path == '/api/resolve-official':
         return WORKFLOW.resolve_candidate(data.get('candidate_id'))
     if path == '/api/register-product-override':
+        if PUBLIC:
+            # 배포 서버의 디스크는 재시작 때 지워집니다. 로컬에서 등록한 verified_products.json을 커밋하세요.
+            raise ServiceError('배포 사이트에서는 보완 데이터를 등록할 수 없습니다. 로컬 실행에서 등록하세요.')
         return WORKFLOW.register_product_override(data.get('candidate_id'), data.get('override'))
     if path == '/api/product-support':
         return WORKFLOW.product_support(data.get('candidate_id'))
@@ -169,7 +174,28 @@ class Handler(BaseHTTPRequestHandler):
     def valid_host(self):
         return self.headers.get('Host') == ALLOWED_HOST
 
+    def authorized(self):
+        if not PASSWORD:
+            return True
+        header = self.headers.get('Authorization', '')
+        try:
+            given = base64.b64decode(header.removeprefix('Basic '), validate=True).decode('utf-8').partition(':')[2]
+        except ValueError:
+            return False
+        return hmac.compare_digest(given.encode(), PASSWORD.encode())
+
+    def require_auth(self):
+        if self.authorized():
+            return False
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="runningflow", charset="UTF-8"')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+        return True
+
     def do_GET(self):
+        if self.require_auth():
+            return
         if not self.valid_host():
             self.send(403, {'error': '허용되지 않은 호스트입니다.'})
             return
@@ -194,7 +220,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send(200, raw, mime)
 
     def do_POST(self):
-        if (not self.valid_host() or self.headers.get('Origin') != 'http://' + ALLOWED_HOST
+        if self.require_auth():
+            return
+        if (not self.valid_host() or self.headers.get('Origin') != ('https://' if PUBLIC else 'http://') + ALLOWED_HOST
                 or not hmac.compare_digest(self.headers.get('X-App-Token', ''), TOKEN)):
             self.send(403, {'error': '이 앱 화면에서 요청해 주세요.'})
             return
@@ -227,14 +255,24 @@ class LocalHTTPServer(ThreadingHTTPServer):
 
 
 def run():
-    global ALLOWED_HOST
+    global ALLOWED_HOST, PUBLIC, PASSWORD
     parser = argparse.ArgumentParser(description='러닝플로우 약품 성분 확인')
     parser.add_argument('--no-browser', action='store_true')
     args = parser.parse_args()
-    port = int(settings().get('PORT', '8767'))
-    ALLOWED_HOST = f'127.0.0.1:{port}'
+    conf = settings()
+    port = int(conf.get('PORT', '8767'))
+    PASSWORD = conf.get('APP_PASSWORD', '')
+    # Render는 RENDER_EXTERNAL_HOSTNAME을 자동으로 넣습니다. 다른 도메인은 PUBLIC_HOST로 지정합니다.
+    public_host = conf.get('PUBLIC_HOST') or conf.get('RENDER_EXTERNAL_HOSTNAME', '')
+    if public_host:
+        if not PASSWORD:
+            raise SystemExit('공개 배포에는 APP_PASSWORD 환경변수가 필요합니다. 키가 노출되지 않도록 실행을 중단합니다.')
+        PUBLIC, ALLOWED_HOST, bind = True, public_host, '0.0.0.0'
+        args.no_browser = True
+    else:
+        ALLOWED_HOST, bind = f'127.0.0.1:{port}', '127.0.0.1'
     try:
-        server = LocalHTTPServer(('127.0.0.1', port), Handler)
+        server = LocalHTTPServer((bind, port), Handler)
     except OSError:
         # Reopening the launcher should open the running app rather than report a failure.
         try:
@@ -252,8 +290,11 @@ def run():
                 webbrowser.open('http://' + ALLOWED_HOST)
             return
         raise SystemExit('이 포트를 다른 프로그램 또는 다른 버전의 앱이 사용 중입니다. 기존 실행 창을 종료한 뒤 다시 실행하세요.') from None
-    print(f'러닝플로우 실행: http://{ALLOWED_HOST}')
-    print('키는 .env에 입력하세요. 종료: Ctrl+C. 현재 PC에서만 접속할 수 있습니다.')
+    if PUBLIC:
+        print(f'러닝플로우 배포 실행: https://{ALLOWED_HOST} (포트 {port})', flush=True)
+    else:
+        print(f'러닝플로우 실행: http://{ALLOWED_HOST}')
+        print('키는 .env에 입력하세요. 종료: Ctrl+C. 현재 PC에서만 접속할 수 있습니다.')
     if not args.no_browser:
         webbrowser.open('http://' + ALLOWED_HOST)
     try:

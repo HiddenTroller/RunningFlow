@@ -25,7 +25,36 @@ MFDS_BASE_URL=https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService08
 PORT=8767
 ```
 
-수정본은 요청에 따라 키를 **이 폴더의 .env에서만** 읽습니다. 운영체제 환경변수로 덮어쓰지 않습니다. `UPSTAGE_CONFIG_ID`가 남아 있거나 값이 있어도 무시하고 항상 최신 확정 설정만 요청합니다. 상태 화면에 정책과 확인 시각을 표시합니다. 새로고침은 설정 상태만 갱신하고 사진은 분석 버튼을 눌렀을 때만 전송합니다.
+이 폴더에 `.env`가 있으면 키를 **.env에서만** 읽고 운영체제 환경변수로 덮어쓰지 않습니다. `.env`가 없으면(Render 등 배포 환경) 운영체제 환경변수를 읽습니다. 두 곳의 값을 섞지 않습니다. `UPSTAGE_CONFIG_ID`가 남아 있거나 값이 있어도 무시하고 항상 최신 확정 설정만 요청합니다. 상태 화면에 정책과 확인 시각을 표시합니다. 새로고침은 설정 상태만 갱신하고 사진은 분석 버튼을 눌렀을 때만 전송합니다.
+
+## Render 무료 배포
+
+`.env`는 `.gitignore`에 있어 GitHub에 올라가지 않습니다. 배포 서버의 키는 Render 대시보드의 환경변수로 넣습니다.
+
+1. Render → **New → Web Service** → GitHub 저장소 `runningflow` 연결
+2. 설정
+   - Runtime: `Python 3`
+   - Build Command: `echo no-dependencies` (표준 라이브러리만 사용)
+   - Start Command: `python main.py --no-browser`
+   - Instance Type: `Free`
+3. **Environment**에 아래 값을 입력합니다. `PORT`와 `RENDER_EXTERNAL_HOSTNAME`은 Render가 자동으로 넣으므로 입력하지 않습니다.
+
+| 이름 | 값 |
+| --- | --- |
+| `APP_PASSWORD` | 사이트 접속 비밀번호(필수, 없으면 서버가 시작하지 않음) |
+| `MFDS_SERVICE_KEY` | 식약처 일반 인증키(Decoding) |
+| `UPSTAGE_API_KEY` | Upstage 키 |
+| `UPSTAGE_AGENT_ID` | `agt_ZFvwgYPuoG7ppQanNZhNqL` |
+| `MFDS_BASE_URL` | `https://apis.data.go.kr/1471000/DrugPrdtPrmsnInfoService08` |
+| `MFDS_EASY_ENABLED`, `MFDS_MAX_DOSE_ENABLED` 등 | 추가 API를 쓸 때만 (`docs/추가_API_설정안내.md`) |
+
+4. 배포 후 `https://<서비스이름>.onrender.com`에 접속하면 브라우저가 아이디·비밀번호를 묻습니다. 아이디는 아무 값이나, 비밀번호는 `APP_PASSWORD`입니다.
+
+배포 모드의 차이:
+- `RENDER_EXTERNAL_HOSTNAME`(또는 직접 지정한 `PUBLIC_HOST`)이 있으면 `0.0.0.0`에 바인딩하고 https 출처만 허용합니다. 다른 도메인을 연결하면 `PUBLIC_HOST`에 그 도메인을 넣습니다.
+- 무료 플랜은 15분간 접속이 없으면 잠들고, 다음 첫 접속에 30초~1분이 걸립니다. 서버 메모리의 확인 정보도 함께 사라집니다.
+- 배포 서버의 디스크는 재시작 때 지워지므로 품목별 보완 데이터 등록은 막혀 있습니다. 로컬 실행에서 등록한 뒤 `verified_products.json`을 커밋·푸시하면 배포 사이트에 적용됩니다.
+- 키를 바꾸려면 Render 환경변수를 수정합니다. 저장하면 자동으로 재시작됩니다.
 
 ## 새 흐름
 
@@ -78,7 +107,7 @@ node tests/test_ui.cjs
 - 코드가 있는 성분은 코드로, 코드 없는 성분끼리는 정규화한 이름으로 묶습니다. 코드가 있는 행과 없는 행을 이름으로 강제 연결하지는 않습니다. 이름이 같아도 염형·역가 등 생물학적 동등성은 별도로 검토해야 합니다.
 - 공식 기준 수량이나 단위가 불명확한 API 응답은 자동 계산하지 않습니다. 규격 코드 해석이나 자유 서술의 복잡한 성분표 해석은 후속 작업입니다.
 - 사진에서 기준 수량이 없으면 nominal 함량만 비교합니다. 명시된 기준이 1 이외인데 상대 기준이 없거나 단위가 다르면 함량 미확인입니다. 성분 대조 일치는 제품 전체 동일성 보장이 아니므로 제조사·제형을 사람이 확인해야 합니다.
-- 후보 상세 요청은 순차 실행이므로 후보가 많으면 오래 걸릴 수 있습니다. 네트워크 캐시·백그라운드 작업·배포용 인증은 범위 밖입니다.
+- 후보 상세 요청은 순차 실행이므로 후보가 많으면 오래 걸릴 수 있습니다. 네트워크 캐시·백그라운드 작업은 범위 밖입니다. 배포 인증은 `APP_PASSWORD` 공용 비밀번호 하나뿐이며 사용자별 계정은 없습니다.
 - 삭제 요청은 시도이며 삭제 실패/작업 시간초과 때 Studio에서 파일과 작업 상태를 별도로 확인해야 합니다. 파일 ID를 받기 전 네트워크가 끊겼으면 삭제할 ID를 알 수 없습니다.
 - 실제 API 호출 성공과 실제 사진 추출 정확도는 사용자가 키를 넣은 뒤 확인해야 합니다. 기존 Agent의 Extract 키를 이 요청의 스키마와 맞춰야 합니다.
 
