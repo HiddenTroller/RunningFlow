@@ -8,11 +8,11 @@ from studio_client import analyze_photo
 
 
 class LatestRefreshTests(unittest.TestCase):
-    def test_status_latest_even_with_old_pin(self):
+    def test_status_pinned15_even_with_old_pin(self):
         with patch('main.settings', return_value={'UPSTAGE_CONFIG_ID':'7','UPSTAGE_AGENT_ID':'agt_test','UPSTAGE_API_KEY':'secret-test'}):
             status = main.status_payload()
-        self.assertEqual(status['config_policy'], 'latest')
-        self.assertIsNone(status['requested_config_id'])
+        self.assertEqual(status['config_policy'], 'pinned')
+        self.assertEqual(status['requested_config_id'],'15')
         self.assertTrue(status['legacy_config_ignored'])
         self.assertNotIn('secret-test', json.dumps(status))
 
@@ -61,14 +61,14 @@ class LatestRefreshTests(unittest.TestCase):
         self.assertEqual(headers['Pragma'], 'no-cache')
         self.assertEqual(headers['Expires'], '0')
 
-    def test_analysis_rereads_agent_without_pinning(self):
+    def test_analysis_rereads_agent_but_always_pins15(self):
         models = []
         def request(path, key, payload=None, content_type=None, method=None):
             if path == '/files': return {'id':'file-test'}
             if method == 'DELETE': return {'deleted':True}
             body = json.loads(payload)
             models.append(body['model'])
-            self.assertNotIn('config_id',body)
+            self.assertEqual(body['config_id'],'15')
             return {'id':'job-test','status':'completed','output_text':'{}'}
         configs = [{'UPSTAGE_API_KEY':'test','UPSTAGE_AGENT_ID':'agt_first','UPSTAGE_CONFIG_ID':'1'},
                    {'UPSTAGE_API_KEY':'test','UPSTAGE_AGENT_ID':'agt_second','UPSTAGE_CONFIG_ID':'2'}]

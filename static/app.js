@@ -9,12 +9,7 @@ function recoveryHint(message) {
   if (/함량|단위|충돌/.test(message)) return '제품·제형·함량을 확인하세요. 불명확한 제품은 제외하거나 추가 관리에서 근거를 보완할 수 있습니다.';
   return '입력값을 확인하고 다시 시도해 주세요.';
 }
-let statusTimer = null;
-const say = message => {
-  if(statusTimer!==null)clearTimeout(statusTimer);
-  const box=$('#status');box.textContent=message;
-  statusTimer=message?setTimeout(()=>{box.textContent='';statusTimer=null;},5000):null;
-};
+const say = message => { $('#status').textContent = message; };
 function showError(error) {
   const message = error?.message || '요청을 완료하지 못했습니다.';
   say(message + ' ' + recoveryHint(message));
@@ -69,22 +64,12 @@ async function api(path, data) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), path === '/api/product-support' ? 12000 : path === '/api/resolve-official' ? 30000 : 180000);
   try {
-    const sendRequest=()=>fetch(path, {method:'POST', signal:controller.signal, cache:'no-store', headers:{'Content-Type':'application/json','X-App-Token':token}, body:JSON.stringify(data)});
-    let response = await sendRequest();
-    let result = await response.json();
-    // A server restart invalidates the old page token. Retry only a rejected request.
-    if(response.status===403 && result.error==='이 앱 화면에서 요청해 주세요.') {
-      const statusResponse=await fetch('/api/status',{cache:'no-store',signal:controller.signal});
-      const current=await statusResponse.json();
-      if(typeof current.token==='string' && current.token) {
-        token=current.token;response=await sendRequest();result=await response.json();
-      }
-    }
+    const response = await fetch(path, {method:'POST', signal:controller.signal, cache:'no-store', headers:{'Content-Type':'application/json','X-App-Token':token}, body:JSON.stringify(data)});
+    const result = await response.json();
     if (!response.ok) {
       if(path === '/api/evaluate' && /만료|확인 정보/.test(result.error || '')) {
         basket=basket.map(p=>({...p,pending:true,restored_pending:true,comparison_warnings:['공식 확인이 만료됐습니다. 다시 확인해 주세요.']}));renderBasket();
       }
-      if (/지원하지 않는 요청/.test(result.error || '') && /duplicates/.test(path)) throw Error('실행 중인 Python 서버가 이전 버전입니다. 터미널에서 Ctrl+C로 종료한 뒤 복사본의 python main.py를 다시 실행하고 새로고침해 주세요.');
       throw Error(result.error || '요청을 처리하지 못했습니다.');
     }
     $('#errorHelp').hidden=true;
@@ -106,7 +91,7 @@ async function start() {
     const result = await (await fetch('/api/status', {cache:'no-store'})).json();
     token = result.token;
     const checkedAt = result.checked_at ? new Date(result.checked_at).toLocaleTimeString('ko-KR') : '';
-    $('#connection').textContent = `최신 설정 요청 / 연결 확인 ${checkedAt} / 식약처 키 ${result.mfds_ready ? '입력됨' : '미입력'} / Upstage 키 ${result.studio_ready ? '입력됨' : '미입력'}${result.legacy_config_ignored ? ' / 환경 변수의 과거 고정 번호는 무시됨' : ''}`;
+    $('#connection').textContent = `설정 ${result.requested_config_id}번 고정 / 연결 확인 ${checkedAt} / 식약처 키 ${result.mfds_ready ? '입력됨' : '미입력'} / Upstage 키 ${result.studio_ready ? '입력됨' : '미입력'}${result.legacy_config_ignored ? ' / 환경 변수의 다른 설정 번호는 무시됨' : ''}`;
   } catch { say('Python 서버 연결을 확인하세요.'); }
 }
 
@@ -118,7 +103,7 @@ function profileIsComplete() {
 function updateProfileControls() {
   const complete = profileIsComplete();
   $('#evaluate').disabled = busy || (typeof batchRunning !== 'undefined' && batchRunning) || !complete;
-  $('#profileRequired').textContent = '';
+  $('#profileRequired').textContent = complete ? '' : '만 나이와 체중을 입력하면 비교할 수 있습니다.';
 }
 
 function invalidate() {
@@ -165,7 +150,7 @@ function renderPhotoSummary(extracted, studio) {
   } else {
     $('#photoSummary').innerHTML = extractionTable;
   }
-  const policy = studio ? `최신 설정 요청 / Instruct 원문 표시` : '가져온 Extract JSON';
+  const policy = studio ? `설정 ${studio.requested_config_id}번 고정 요청 / Instruct 원문 표시` : '가져온 Extract JSON';
   $('#analysisVersion').textContent = `${policy} / ${studio?.config_id ? '응답 설정 ' + studio.config_id : '응답에 설정 번호 없음'}${studio?.final_model ? ' / 최종 노드 ' + studio.final_model : ''}`;
 }
 
@@ -187,7 +172,7 @@ async function renderCandidates(result) {
   } else if (candidates.length) {
     $('#productPicker').hidden = false;
     $('#productPicker').open = true;
-    $('#photoStep').scrollIntoView({behavior:'smooth'});
+    $('#basket').scrollIntoView({behavior:'smooth'});
     say(result.search_mode === 'similar' ? '비슷한 이름의 제품입니다. 사진과 제품명·함량·제형이 같은지 확인하고 선택하세요.' : '2번의 제품 선택 메뉴에서 맞는 제품명을 선택하세요.');
   } else {
     $('#productPicker').hidden = true;
@@ -219,7 +204,7 @@ async function chooseProduct(event) {
   try {
     await applySelected();
     $('#selectionStatus').textContent = basket.some(p => p.code === String(candidate.product.ITEM_SEQ))
-      ? '선택한 제품이 아래 목록에 적용되었습니다. 제품명을 확인한 뒤 중복 성분 확인을 눌러 주세요.' : '';
+      ? '선택한 제품이 아래 목록에 적용되었습니다. 수량 또는 확인이 필요한 항목을 입력하세요.' : '';
   } catch (error) {
     const message = '제품 적용 실패: ' + error.message + ' ' + recoveryHint(error.message);
     $('#selectionStatus').textContent = message;
@@ -245,15 +230,13 @@ let nextGroupId = 0;
 function renderBatchQueue() {
   $('#batchChoices').innerHTML = photoGroups.map(group=>{
     const finished=group.status==='applied';
-    return '<div class="photo-choice-row"><details class="photo-choice" '+(!finished?'open':'')+'><summary>'+'사진 '+group.id+' · '+esc(group.filename)+' · '+esc(finished?'목록에 추가됨':group.status==='error'?'분석 실패':group.status==='processing'?'처리 중':group.status==='empty'?'제품 미확인':'제품 선택 필요')+'</summary>'+
+    return '<details class="photo-choice" '+(!finished?'open':'')+'><summary>'+'사진 '+group.id+' · '+esc(group.filename)+' · '+esc(finished?'목록에 추가됨':group.status==='error'?'분석 실패':group.status==='processing'?'처리 중':group.status==='empty'?'제품 미확인':'제품 선택 필요')+'</summary>'+
       (group.message?'<p>'+esc(group.message)+'</p>':'')+
       (!finished && group.result?.candidates?.length?'<div role="radiogroup" aria-label="'+esc(group.filename)+' 제품 선택">'+group.result.candidates.map((c,i)=>'<label class="product-option"><input type="radio" name="photo-group-'+group.id+'" data-photo-group="'+group.id+'" data-photo-option="'+i+'" '+(batchRunning || selectingProduct?'disabled':'')+'><span>'+esc(c.product.ITEM_NAME || '제품명 미확인')+'</span></label>').join('')+'</div>':'')+
-      (group.status==='error' || group.status==='empty'?'<p class="muted">제품명이 선명한 사진을 다시 선택해 분석하세요. 다른 사진의 결과는 유지됩니다.</p>':'')+'</details><button type="button" class="remove-photo-log" data-remove-photo="'+group.id+'" '+(batchRunning || selectingProduct || busy?'disabled':'')+' aria-label="'+esc(group.filename)+' 분석 내역 삭제">내역 삭제 ×</button></div>';
+      (group.status==='error' || group.status==='empty'?'<p class="muted">제품명이 선명한 사진을 다시 선택해 분석하세요. 다른 사진의 결과는 유지됩니다.</p>':'')+'</details>';
   }).join('');
 }
 async function choosePhotoGroup(event) {
-  const removeId=event.target?.dataset?.removePhoto;
-  if(removeId!==undefined){removePhotoLog(Number(removeId));return;}
   const id=event.target?.dataset?.photoGroup;
   const option=event.target?.dataset?.photoOption;
   if(id===undefined || option===undefined || batchRunning || busy || selectingProduct)return;
@@ -266,7 +249,7 @@ async function choosePhotoGroup(event) {
     await chooseProduct({target:{dataset:{productOption:option}}});
     const added=basket.find(p=>p.code===String(candidate.product.ITEM_SEQ));
     group.status=added?'applied':'choice';
-    group.message=added?(added.pending?'선택한 제품을 목록에 추가했습니다. 공식 함량은 확인이 필요합니다.':'선택한 제품을 목록에 추가했습니다. 제품명을 확인하세요.'):'제품을 적용하지 못했습니다. 아래 오류 안내를 확인하고 다시 선택하세요.';
+    group.message=added?(added.pending?'선택한 제품을 목록에 추가했습니다. 공식 함량은 확인이 필요합니다.':'선택한 제품을 목록에 추가했습니다. 수량을 입력하세요.'):'제품을 적용하지 못했습니다. 아래 오류 안내를 확인하고 다시 선택하세요.';
   } finally {renderBatchQueue();saveSession();}
 }
 $('#batchChoices').onclick=choosePhotoGroup;
@@ -304,31 +287,16 @@ async function analyzePhotoFiles(files,readPhoto) {
         $('#studioResult').textContent=JSON.stringify(result.studio || {extracted:result.photo_extracted},null,2);
         renderPhotoSummary(result.photo_extracted,result.studio);
         $('#searchReason').textContent='최근 분석 사진: '+file.name+' · '+(result.search_name || result.photo_extracted?.product_name_raw || '제품명 미확인');
-        const entries=Array.isArray(result.products)?result.products:[result];
-        if(!entries.length){group.status='empty';group.message=result.reason || '약품을 찾지 못했습니다.';}
-        for(let productIndex=0;productIndex<entries.length;productIndex++) {
-          const productResult=entries[productIndex];
-          let productGroup=group;
-          if(result.multi_product) {
-            productGroup=productIndex===0?group:{id:++nextGroupId,status:'processing',message:'',result:null};
-            productGroup.filename=file.name+' · 제품 '+(productIndex+1)+' · '+(productResult.search_name || '확인필요');
-            if(productIndex>0){photoGroups.push(productGroup);groups.push(productGroup);}
-          }
-          productGroup.result=productResult;
-          try {
-          const choices=productResult.candidates || [];
-        if(choices.length===1 && Number(productResult.total ?? 1)===1 && !productResult.requires_selection && productResult.search_mode!=='similar') {
-          candidates=choices;photoId=productResult.photo_id;
+        const choices=result.candidates || [];
+        if(choices.length===1 && Number(result.total ?? 1)===1 && !result.requires_selection && result.search_mode!=='similar') {
+          candidates=choices;photoId=result.photo_id;
           await chooseProduct({target:{dataset:{productOption:'0'}}});
           const added=basket.find(p=>p.code===String(choices[0].product.ITEM_SEQ));
-          productGroup.status=added?'applied':'choice';
-          productGroup.message=added?(added.pending?'제품 선택 완료 · 공식 함량 확인 필요':'후보 1개를 자동 적용했습니다. 동일 제품은 중복 추가하지 않습니다.'):'적용 실패. 분석이 끝난 뒤 이 사진의 제품을 다시 선택하세요.';
+          group.status=added?'applied':'choice';
+          group.message=added?(added.pending?'제품 선택 완료 · 공식 함량 확인 필요':'후보 1개를 자동 적용했습니다. 동일 제품은 중복 추가하지 않습니다.'):'적용 실패. 분석이 끝난 뒤 이 사진의 제품을 다시 선택하세요.';
         } else {
-          productGroup.status=choices.length?'choice':'empty';
-          productGroup.message=choices.length?(productResult.search_mode==='similar'?'비슷한 이름의 후보입니다. 사진과 제품명·제형·함량을 확인해 선택하세요.':'이 사진에 해당하는 제품 하나를 선택하세요.'):(productResult.reason || '공식 제품을 찾지 못했습니다.');
-        }
-          } catch(error){productGroup.status='error';productGroup.message=error.message || '제품 적용 실패';}
-          renderBatchQueue();saveSession();
+          group.status=choices.length?'choice':'empty';
+          group.message=choices.length?(result.search_mode==='similar'?'비슷한 이름의 후보입니다. 사진과 제품명·제형·함량을 확인해 선택하세요.':'이 사진에 해당하는 제품 하나를 선택하세요.'):(result.reason || '공식 제품을 찾지 못했습니다.');
         }
       } catch(error) {group.status='error';group.message=(error.message || '분석 실패')+' '+recoveryHint(error.message || '');}
       renderBatchQueue();saveSession();
@@ -337,7 +305,7 @@ async function analyzePhotoFiles(files,readPhoto) {
     batchRunning=false;$('#image').disabled=false;$('#jsonImport').disabled=false;updateProfileControls();renderBatchQueue();saveSession();
     const remaining=groups.filter(g=>g.status==='choice').length;
     $('#batchProgress').textContent=files.length+'장 처리 완료 · 선택 대기 '+remaining+'장 · 실패/미확인 '+groups.filter(g=>['error','empty'].includes(g.status)).length+'장';
-    $('#photoStep').scrollIntoView({behavior:'smooth'});
+    $('#basket').scrollIntoView({behavior:'smooth'});
     say('사진 처리를 완료했습니다. 사진별 선택 항목과 제품 목록을 확인하세요.');
   }
 }
@@ -388,8 +356,8 @@ async function applySelected() {
   basket.push({...result.product, approval_id:result.approval_id, support,candidate_id:selected.candidate_id});
   demoMode = false;
   renderBasket();
-  say('선택한 제품을 공식 성분으로 적용했습니다. 가정 제품명을 확인하세요.' + (result.comparison_status !== '일치' ? ' 사진 대조 결과는 확인 필요입니다.' : ''));
-  $('#photoStep').scrollIntoView({behavior:'smooth'});
+  say('선택한 제품을 공식 성분으로 적용했습니다. 가정 수량을 입력하세요.' + (result.comparison_status !== '일치' ? ' 사진 대조 결과는 확인 필요입니다.' : ''));
+  $('#basket').scrollIntoView({behavior:'smooth'});
   await loadSelectedSupport(selected.candidate_id);
 }
 
@@ -433,7 +401,6 @@ function pendingOfficialAmounts(product) {
 }
 
 function renderBasket() {
-  updateStepOneProducts();
   invalidate();
   $('#basketCount').textContent = basket.length + '개';
   $('#basketHint').textContent = !basket.length ? '사진을 분석한 뒤 제품을 선택해 주세요.' : basket.some(p => p.pending) ? '함량 확인이 필요한 제품은 제외하거나 보완한 뒤 비교해 주세요.' : '0으로 입력한 약은 합산에서 제외됩니다. 액상약은 mL 단위로 입력하세요.';
@@ -505,19 +472,26 @@ $('#overrideForm').onsubmit = async event => {
 };
 
 function updateIntentHelp() {
-  $('#preventiveMission').hidden=true;
-  $('#serviceTitle').textContent='여러 약의 중복 성분을 확인하세요.';
-  $('#servicePurpose').textContent='사진 속 약을 공식 제품 정보와 연결하고 여러 제품에 같은 유효성분이 포함되어 있는지 확인합니다.';
+  const planned = $('#quantityIntent').value !== 'taken';
+  $('#preventiveMission').hidden = !planned;
+  $('#serviceTitle').textContent = planned ? '먹기 전, 여러 약의 위험 신호를 확인하세요.' : '이미 먹은 약의 성분과 양을 확인하세요.';
+  $('#servicePurpose').textContent = planned
+    ? '여러 약의 중복 성분과 용량 기준 초과, 공식 복용 주의사항을 확인해 사용자가 복용 전 위험 신호를 발견하도록 돕습니다.'
+    : '입력한 복용량을 기준으로 중복 성분과 합산량을 확인합니다. 복용 시각·간격을 평가하거나 추가 복용 가능 여부를 판단하지 않습니다.';
+
+  $('#intentHelp').textContent = $('#quantityIntent').value === 'taken'
+    ? '입력한 복용량만 합산합니다. 복용 시각·간격은 평가하지 않으며 추가로 먹을 수 있는 양을 뜻하지 않습니다.'
+    : '예정한 양만 비교합니다. 이미 먹은 양은 자동으로 더하지 않으며, 결과는 복용 허가가 아닙니다.';
 }
 $('#quantityIntent').onchange = () => { updateIntentHelp();invalidate(); };
 $('#mode').onchange = invalidate;
-$('#ageYears').oninput = saveSession;
-$('#weightKg').oninput = saveSession;
+$('#ageYears').oninput = invalidate;
+$('#weightKg').oninput = invalidate;
 
 
 $('#clear').onclick = () => {
   if(batchRunning || selectingProduct || busy){say('진행 중인 처리가 끝난 뒤 목록을 비워 주세요.');return;}
-  basket=[];demoMode=false;photoGroups=[];goToStep(1);renderBatchQueue();$('#batchProgress').textContent='';
+  basket=[];demoMode=false;photoGroups=[];renderBatchQueue();$('#batchProgress').textContent='';
   for(const id of ['ageYears','weightKg']) $('#'+id).value='';
   $('#errorHelp').hidden=true;
   $('#quantityIntent').value='planned';updateIntentHelp();
@@ -540,7 +514,7 @@ $('#evaluate').onclick = async () => {
     $('#download').disabled = false;
     $('#result').className = '';
     renderComparisonResult(report);
-    goToStep(3);
+    $('#resultStep').scrollIntoView({behavior:'smooth'});
     say('성분과 용량 기준 비교를 완료했습니다.');
   } catch (error) { showError(error); }
 };
@@ -625,77 +599,3 @@ function renderComparisonResult(report) {
   const warningHtml='<p class="muted">공식 허가 원문입니다. 모든 상호작용을 검사한 결과가 아니며, 원문이 없다고 주의사항이 없는 것은 아닙니다.</p>'+ (warnings.length?warnings.map(p=>'<details class="warning-product"><summary>'+esc(p.product_name)+'</summary><pre>'+esc(p.warnings_text || '공식 주의사항을 받지 못했습니다. 제품 설명서를 확인하세요.')+'</pre>'+(p.source_url?'<a href="'+esc(p.source_url)+'" target="_blank" rel="noopener noreferrer">공식 제품 정보 ↗</a>':'')+'</details>').join(''):'<p>공식 주의사항 원문을 받지 못했습니다. 제품 설명서를 확인하세요.</p>');
   $('#result').innerHTML=`<section class="simple-result ${tone}"><div class="result-eyebrow">${taken?'이미 먹은 양 · 사후 확인':'앞으로 먹을 양 · 복용 전 확인'}<span>${esc(period)}</span></div><h3>${esc(title)}</h3><div class="summary-metrics"><div><span>제품 용법 초과</span><strong>${productOver.length}<small>개</small></strong></div><div><span>성분 기준 초과</span><strong>${ingredientOver.length}<small>종</small></strong></div><div><span>중복 성분</span><strong>${duplicate.length}<small>종</small></strong></div><div><span>합산 미판정</span><strong>${unknown.length}<small>종</small></strong></div></div>${ageRestricted.length?'<p class="summary-restriction">복용 금지 연령 해당: '+ageRestricted.length+'개 제품</p>':''}<p class="summary-scope">제품 용법 미판정 ${productUnknown.length}개 · 확인 제품 ${products.length}개 / 성분 ${ingredients.length}종</p></section><p class="result-boundary">기준 미초과는 복용 가능을 뜻하지 않습니다. 복용 간격·개인 건강 상태·병용금기는 별도 확인이 필요합니다.</p><section class="priority-panel"><h3>가장 먼저 확인할 내용</h3>${priorities.length?'<div class="priority-list">'+priorities.slice(0,3).map((item,n)=>'<article class="priority-item '+item.tone+'"><span class="priority-order">'+(n+1)+'</span><div><span class="priority-tag">'+esc(item.tag)+'</span><h4>'+esc(item.name)+'</h4><p>'+esc(item.text)+'</p></div></article>').join('')+'</div>':'<p class="muted">등록된 수치 기준 초과는 확인되지 않았습니다. 공식 주의사항도 확인하세요.</p>'}${priorities.length>3?'<p class="more-results">추가 확인 항목 '+(priorities.length-3)+'개는 아래 상세 비교에서 볼 수 있습니다.</p>':''}</section>${taken?'<details class="result-disclosure"><summary>등록 기준 대비 섭취 비율 보기 <span>위험도 점수 아님</span></summary>'+intakeReferenceHtml(report)+'</details>':''}<details class="result-disclosure full-comparison"><summary>상세 비교 펼치기 <span>제품별 용법 · 전체 성분 · 초과량 · 공식 용법</span></summary><div class="detail-content">${detailedComparisonHtml(report)}</div></details><details class="result-disclosure official-warnings"><summary>공식 주의사항 펼치기 <span>${taken?'복용 후 주의사항·이상반응':'병용 약·음식·음주 관련 원문'}</span></summary><div class="detail-content">${warningHtml}</div></details>`;
 }
-
-
-// One task at a time: product identity, quantities, then computed result.
-let currentStep = 1;
-function updateStepOneProducts() {
-  $('#stepOneProducts').innerHTML = basket.length ? '<strong>추가한 제품 '+basket.length+'개</strong>'+basket.map((p,n)=>'<div class="step-product"><span>'+esc(p.name)+'</span><small>'+ (p.pending?'공식 함량 확인 필요':'제품 적용 완료')+'</small><button type="button" data-remove-step-product="'+n+'" aria-label="'+esc(p.name)+' 제품 제외">제외 ×</button></div>').join('') : '';
-  $('#stepOneHint').textContent = basket.length ? '제품을 확인한 뒤 중복 성분 확인을 누르세요. 함량 미확인 제품도 공식 성분명으로 비교하며, 성분이 없는 제품은 결과에서 따로 표시합니다.' : '사진을 분석하고 제품을 추가하면 다음 단계로 이동할 수 있습니다.';
-}
-function goToStep(step) {
-  if(busy || batchRunning || selectingProduct){say('진행 중인 작업이 끝난 뒤 이동해 주세요.');return false;}
-  if(step===2 && !basket.length){say('먼저 1번에서 제품을 추가해 주세요.');return false;}
-  if(step===2 && photoGroups.some(g=>g.status==='choice')){say('1번에서 사진별 제품 선택을 완료해 주세요.');return false;}
-  if(step===3 && !lastReport){say('1번에서 제품을 추가하고 중복 성분 확인을 눌러 주세요.');return false;}
-  currentStep=step;
-  ['photoStep','basket','resultStep'].forEach((id,n)=>{$('#'+id).hidden=n+1!==step;});
-  document.querySelectorAll('[data-wizard-step]').forEach(link=>{
-    link.dataset.active=String(Number(link.dataset.wizardStep)===step);
-    link.setAttribute('aria-current',Number(link.dataset.wizardStep)===step?'step':'false');
-  });
-  $('#'+['photoStep','basket','resultStep'][step-1]).scrollIntoView({behavior:'smooth',block:'start'});
-  return true;
-}
-$('#nextToQuantity').onclick=checkDuplicates;
-$('#backToPhoto').onclick=()=>goToStep(1);
-$('#backToQuantity').onclick=()=>goToStep(1);
-document.querySelectorAll('[data-wizard-step]').forEach(link=>{link.onclick=event=>{event.preventDefault();goToStep(Number(link.dataset.wizardStep));};});
-goToStep(1);
-
-function removePhotoLog(id) {
-  if(busy || batchRunning || selectingProduct){say('진행 중인 작업이 끝난 뒤 삭제해 주세요.');return;}
-  photoGroups=photoGroups.filter(g=>g.id!==id);
-  renderBatchQueue();saveSession();
-  $('#batchProgress').textContent='';
-  say('사진 분석 내역을 지웠습니다. 추가한 제품은 유지됩니다. 제품도 빼려면 아래 제품의 제외 버튼을 누르세요.');
-}
-function removeStepProduct(index) {
-  if(busy || batchRunning || selectingProduct){say('진행 중인 작업이 끝난 뒤 제외해 주세요.');return;}
-  if(!Number.isInteger(index) || index<0 || index>=basket.length)return;
-  const name=basket[index].name;
-  basket.splice(index,1);if(!basket.length)demoMode=false;
-  renderBasket();say(name+' 제품을 계산 목록에서 제외했습니다.');
-}
-$('#stepOneProducts').onclick=event=>{
-  const index=event.target?.dataset?.removeStepProduct;
-  if(index!==undefined)removeStepProduct(Number(index));
-};
-
-async function checkDuplicates() {
-  try {
-    if(busy || batchRunning || selectingProduct)throw Error('진행 중인 작업이 끝난 뒤 확인하세요.');
-    if(!basket.length)throw Error('제품을 먼저 추가해 주세요.');
-    if(photoGroups.some(g=>g.status==='choice'))throw Error('사진별 제품 선택을 완료하거나 해당 내역을 삭제해 주세요.');
-    if(basket.some(p=>p.pending && !p.candidate_id))throw Error('공식 확인 정보가 만료된 제품이 있습니다. 제품을 다시 분석하거나 제외해 주세요.');
-    for(const [id,max] of [['ageYears',130],['weightKg',500]]) {
-      const v=$('#'+id).value.trim();
-      if(v!=='' && (!Number.isFinite(Number(v)) || Number(v)<0 || Number(v)>max || (id==='weightKg' && Number(v)===0)))throw Error('선택 입력한 나이·체중의 범위를 확인해 주세요.');
-    }
-    const report=await api(demoMode?'/api/demo-duplicates':'/api/check-duplicates',{products:basket.map(p=>p.approval_id?{approval_id:p.approval_id}:{candidate_id:p.candidate_id})});
-    lastReport=report;$('#download').disabled=false;$('#result').className='';
-    const duplicates=report.ingredients.filter(i=>i.duplicate);
-    const unconfirmed=report.unconfirmed_products || [];
-    const row=i=>'<article class="priority-item"><div><h4>'+esc(i.ingredient)+'</h4><p>'+i.products.map(p=>esc(p.name)).join('<br>')+'</p><small>'+esc(i.grouping)+'</small></div></article>';
-    $('#result').innerHTML='<section class="simple-result '+(duplicates.length?'review':'neutral')+'"><h3>'+(duplicates.length?'같은 성분이 '+duplicates.length+'종 겹칩니다':(unconfirmed.length?'확인한 범위에서 중복 없음 · 일부 제품 성분 미확인':'확인한 공식 성분에서 중복이 발견되지 않았습니다'))+'</h3><p>확인 제품 '+report.product_count+'개 · 유효성분 '+report.ingredients.length+'종</p></section><p class="result-boundary">중복 여부만 확인한 결과입니다. 중복이 없더라도 함께 복용할 수 있다는 뜻은 아닙니다. 섭취량과 용량 기준 초과는 계산하지 않습니다.</p><section class="priority-panel"><h3>중복 성분과 포함 제품</h3>'+(duplicates.length?duplicates.map(row).join(''):'<p>확인한 제품 간 동일 성분 중복 없음</p>')+'</section><details class="result-disclosure"><summary>전체 유효성분 보기</summary><div class="detail-content">'+report.ingredients.map(row).join('')+'</div></details>';
-    if(unconfirmed.length)$('#result').innerHTML='<div class="notice amber">성분 일부 또는 전체 미확인 '+unconfirmed.length+'개: '+unconfirmed.map(p=>esc(p.name)).join(' · ')+'. 아래 중복 결과는 확인된 공식 성분만 대상으로 합니다.</div>'+$('#result').innerHTML;
-    const productCards=(report.products || []).map(p=>'<article class="result-product-card"><div class="result-product-heading"><h4>'+esc(p.name)+'</h4></div>'+(p.amount_unconfirmed?'<p class="muted">함량 미확인 · 공식 성분명으로만 중복 확인</p>':'')+(p.ingredient_identity_partial?'<p class="danger">성분 일부 또는 전체 확인 필요</p>':'')+'<div class="daily-max-block" tabindex="0" role="region" aria-label="공식 용법·용량 원문 스크롤 영역"><span>'+ (p.daily_max_text?'하루 최대 복용량 · 공식 표시 원문':p.daily_directions_text?'공식 1일 복용법 · 최대량 별도 명시 없음':'하루 최대 복용량 · 확인 필요')+'</span><p>'+esc(p.directions_text || p.daily_max_text || p.daily_directions_text || '공식 용법·용량 원문을 확인하지 못했습니다. 제품 설명서를 확인하세요.').replace(/\n/g,'<br>')+'</p><small>원문의 적응증·연령·복용 간격에 한정된 정보입니다.</small></div><div class="product-reference-actions"><details class="mini-reference"><summary>주의사항</summary><pre>'+esc(p.warnings_text || '공식 주의사항을 받지 못했습니다. 제품 설명서를 확인하세요.')+'</pre></details></div>'+(p.source_url?'<a href="'+esc(p.source_url)+'" target="_blank" rel="noopener noreferrer">공식 제품 정보 ↗</a>':'')+'</article>').join('');
-    $('#result').innerHTML='<section class="selected-products-result"><h3>확인한 약 제품</h3><p class="muted">아래 최대량은 제품의 공식 표시 원문이며, 개인별 권장량이나 여러 약의 합산 한도가 아닙니다. 원문의 연령·제형·복용 간격 조건을 함께 확인하세요.</p><div class="result-product-grid">'+productCards+'</div></section>'+$('#result').innerHTML;
-    goToStep(3);say('중복 성분 확인을 완료했습니다.');
-  } catch(error){showError(error);}
-}
-
-// Native dialog keeps background layout and supports Escape/focus restoration.
-$('#openUserProfile').onclick=()=>$('#userProfileDialog').showModal();
-$('#closeUserProfile').onclick=()=>$('#userProfileDialog').close();
-$('#userProfileDialog').onclick=event=>{if(event.target!==$('#userProfileDialog'))return;const rect=event.target.getBoundingClientRect();if(event.clientX<rect.left || event.clientX>rect.right || event.clientY<rect.top || event.clientY>rect.bottom)event.target.close();};
